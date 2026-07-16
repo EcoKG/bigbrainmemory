@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "bigbrainmemory": {
+      "command": "node",
+      "args": ["D:/BigBrainMemory/dist/index.js"],
+      "env": {
+        "BIGBRAIN_VAULT": "D:/BigBrainMemory/vault"
+      }
+    }
+  }
+}

@@ -1,0 +1,163 @@
+// BigBrainMemory 스모크 테스트 — 실제 MCP 클라이언트로 stdio 서버를 구동해 전체 기억 사이클을 검증
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const root = path.resolve(here, "..");
+const testVault = path.join(root, "test-vault");
+
+// 테스트 볼트 초기화
+fs.rmSync(testVault, { recursive: true, force: true });
+
+// 기본은 간격 게이트 0 (매 회상마다 강화 검증). 8번 항목에서 별도 볼트로 게이트 동작을 검증
+const transport = new StdioClientTransport({
+  command: process.execPath,
+  args: [path.join(root, "dist", "index.js")],
+  env: { ...process.env, BIGBRAIN_VAULT: testVault, BIGBRAIN_SPACING_MS: "0" },
+});
+const client = new Client({ name: "smoke-test", version: "0.0.1" });
+
+let failures = 0;
+function check(name, cond, detail = "") {
+  if (cond) console.log(`  ✔ ${name}`);
+  else {
+    failures++;
+    console.error(`  ✘ ${name} ${detail}`);
+  }
+}
+
+async function call(name, args = {}) {
+  const res = await client.callTool({ name, arguments: args });
+  const text = res.content?.[0]?.text ?? "";
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    /* 텍스트 응답 */
+  }
+  return { res, text, json };
+}
+
+await client.connect(transport);
+console.log("1) 서버 연결 및 도구 목록");
+const { tools } = await client.listTools();
+const names = tools.map((t) => t.name).sort();
+check(
+  "8개 도구 등록",
+  ["forget", "link", "list_memories", "read_memory", "recall", "reflect", "remember", "revise"].every((n) => names.includes(n)),
+  `got: ${names.join(",")}`,
+);
+
+console.log("2) remember — 기억 저장 (출처 포함, 저장강도 1)");
+const r1 = await call("remember", {
+  title: "사용자는 TypeScript strict 모드를 선호한다",
+  content: "코드 리뷰에서 사용자가 항상 strict: true 설정을 요구했다.",
+  type: "preference",
+  tags: ["typescript", "코딩스타일"],
+  confidence: 0.9,
+  source: "코드 리뷰 대화",
+});
+check("기억 저장됨", r1.json?.stored?.slug, r1.text.slice(0, 200));
+check("초기 저장강도 = 1 (P1/Bjork)", r1.json?.stored?.storage_strength === 1, `ss=${r1.json?.stored?.storage_strength}`);
+check("출처(source) 기록됨 (P8)", r1.json?.stored?.source === "코드 리뷰 대화");
+const slug1 = r1.json.stored.slug;
+
+const r2 = await call("remember", {
+  title: "BigBrainMemory 프로젝트는 Obsidian 볼트를 저장소로 쓴다",
+  content: "MCP 서버의 기억은 vault/ 아래 마크다운 파일로 저장되며 Obsidian에서 열 수 있다.",
+  type: "semantic",
+  tags: ["bigbrainmemory", "obsidian"],
+});
+const slug2 = r2.json.stored.slug;
+check("두 번째 기억 저장됨", !!slug2);
+
+console.log("3) 유사 기억 탐지");
+const r3 = await call("remember", {
+  title: "사용자는 TypeScript strict 모드 설정을 좋아한다",
+  content: "중복 테스트용.",
+  type: "preference",
+});
+check("유사 기억 감지됨", (r3.json?.similar_existing_memories ?? []).length >= 1, r3.text.slice(0, 300));
+await call("forget", { id: r3.json.stored.slug, reason: "중복 테스트 정리" });
+
+console.log("4) recall — 회상 및 강화");
+const r4 = await call("recall", { query: "typescript strict 선호" });
+check("회상 결과 존재", (r4.json?.results ?? []).length >= 1);
+check("가장 관련된 기억이 1위", r4.json?.results?.[0]?.slug === slug1, `top=${r4.json?.results?.[0]?.slug}`);
+
+console.log("5) link — 연상 연결");
+const r5 = await call("link", { source: slug1, target: slug2, relation: "같은 프로젝트 맥락" });
+check("양방향 링크 생성", r5.json?.linked?.source?.links?.includes(slug2) && r5.json?.linked?.target?.links?.includes(slug1));
+
+const r5b = await call("recall", { query: "typescript strict" });
+const assocFound = (r5b.json?.results ?? []).some((r) => r.slug === slug2);
+check("연상(1-hop) 기억이 함께 회상됨", assocFound, r5b.text.slice(0, 400));
+
+console.log("6) revise — 기억 교정");
+const r6 = await call("revise", {
+  id: slug1,
+  reason: "사용자가 일부 프로젝트에서는 strict 해제를 허용한다고 정정",
+  content: "사용자는 기본적으로 strict: true를 선호하지만, 레거시 프로젝트에서는 예외를 허용한다.",
+  confidence: 0.75,
+});
+check("교정 반영 + 이력 기록", r6.json?.revised?.confidence === 0.75 && r6.json?.revised?.history?.some((h) => h.includes("revised")));
+
+console.log("7) 회상 강화 확인 — 능동 recall이 저장강도를 올린다 (P4 검사효과, 간격게이트 0)");
+const before = (await call("read_memory", { id: slug1 })).json;
+const ssBefore = before.storage_strength;
+await call("recall", { query: "typescript strict 선호 모드" });
+const after = (await call("read_memory", { id: slug1 })).json;
+check("능동 회상 후 저장강도 증가", after.storage_strength > ssBefore, `${ssBefore} -> ${after.storage_strength}`);
+check("access_count 누적", after.access_count >= 2, `count=${after.access_count}`);
+
+console.log("8) 간격효과 — 게이트가 켜지면 벼락치기 반복이 저장강도를 부풀리지 않는다 (P3)");
+{
+  const gatedVault = path.join(root, "test-vault-gated");
+  fs.rmSync(gatedVault, { recursive: true, force: true });
+  const t2 = new StdioClientTransport({
+    command: process.execPath,
+    args: [path.join(root, "dist", "index.js")],
+    env: { ...process.env, BIGBRAIN_VAULT: gatedVault, BIGBRAIN_SPACING_MS: "600000" }, // 10분 게이트
+  });
+  const c2 = new Client({ name: "gated", version: "0.0.1" });
+  await c2.connect(t2);
+  const g = JSON.parse((await c2.callTool({ name: "remember", arguments: { title: "간격 테스트 기억", content: "벼락치기 반복 강화 방지 검증.", type: "semantic" } })).content[0].text);
+  const gslug = g.stored.slug;
+  for (let i = 0; i < 4; i++) await c2.callTool({ name: "recall", arguments: { query: "간격 테스트 기억" } });
+  const gAfter = JSON.parse((await c2.callTool({ name: "read_memory", arguments: { id: gslug } })).content[0].text);
+  check("게이트 내 반복 회상은 저장강도를 1회만 올림", gAfter.storage_strength <= 2, `ss=${gAfter.storage_strength}`);
+  await c2.close();
+  fs.rmSync(gatedVault, { recursive: true, force: true });
+}
+
+console.log("9) reflect — 메타인지 리포트 (망각 후보는 제안만)");
+const r8 = await call("reflect", {});
+check("리포트에 카운트 존재", r8.json?.counts?.total >= 2, r8.text.slice(0, 300));
+check("weakened/forget_candidates 필드 존재", Array.isArray(r8.json?.weakened_hard_to_recall) && Array.isArray(r8.json?.forget_candidates));
+
+console.log("10) forget — 망각(아카이브 이동)");
+const r9 = await call("forget", { id: slug2, reason: "테스트 종료" });
+check("아카이브 이동", r9.json?.forgotten?.status === "archived");
+check("파일이 archive/로 이동", fs.existsSync(path.join(testVault, "archive", `${slug2}.md`)));
+
+console.log("11) 볼트 파일 구조 확인");
+check("MEMORY.md 인덱스 생성", fs.existsSync(path.join(testVault, "MEMORY.md")));
+check(
+  "망각된 기억이 memories/에 부활하지 않음",
+  !fs.existsSync(path.join(testVault, "memories", `${r3.json.stored.slug}.md`)) &&
+    !fs.existsSync(path.join(testVault, "memories", `${slug2}.md`)),
+);
+const noteRaw = fs.readFileSync(path.join(testVault, "memories", `${slug1}.md`), "utf-8");
+check("frontmatter에 storage_strength/last_reinforced 포함", noteRaw.includes("storage_strength:") && noteRaw.includes("last_reinforced:"));
+check("위키링크 본문 포함", noteRaw.includes(`[[${slug2}]]`));
+
+await client.close();
+
+if (failures > 0) {
+  console.error(`\n실패: ${failures}건`);
+  process.exit(1);
+}
+console.log("\n모든 스모크 테스트 통과 ✔");

@@ -1,0 +1,33 @@
+{
+  "name": "bigbrainmemory",
+  "version": "0.1.0",
+  "description": "BigBrainMemory — human-like persistent memory MCP server (inspired by Claude Code memory + Obsidian)",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "bigbrainmemory": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "docs"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "node scripts/smoke-test.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "gray-matter": "^4.0.3",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}
