@@ -23,6 +23,13 @@ const SPACING_WINDOW_MS = (() => {
 })();
 /** 인출강도가 이 값 미만이면 "어렵게 찾은" 회상 → 바람직한 어려움 보너스 (P4) */
 const HARD_RETRIEVAL_ACTIVATION = 0.5;
+/**
+ * 간격 게이트에 막힌 접근도 매번 디스크에 기록할지 (기본 false).
+ * accessCount/lastAccessed 는 활성 계산에 쓰이지 않는 표시용 필드라, 조회마다 쓰면
+ * git working tree·Obsidian 동기화·백업이 "읽기만 했는데" 변경을 감지한다(감사 B).
+ * 접근수 통계를 정확히 원하면 BIGBRAIN_FLUSH_EVERY_ACCESS=1 로 켠다.
+ */
+const FLUSH_EVERY_ACCESS = /^(1|true|yes)$/i.test(process.env.BIGBRAIN_FLUSH_EVERY_ACCESS ?? "");
 // -----------------------------------------------------------------------
 
 function nowIso(): string {
@@ -428,7 +435,7 @@ export class MemoryStore {
       episodic: "경험/사건 (episodic)",
       procedural: "방법/절차 (procedural)",
     };
-    let md = `# BigBrainMemory 인덱스\n\n> 자동 생성 파일입니다. 직접 수정하지 마세요. (${nowIso()})\n`;
+    let md = "# BigBrainMemory 인덱스\n\n> 자동 생성 파일입니다. 직접 수정하지 마세요.\n";
     for (const type of Object.keys(groups) as MemoryType[]) {
       const items = groups[type];
       if (items.length === 0) continue;
@@ -476,6 +483,13 @@ export class MemoryStore {
       m.storageStrength += delta;
       m.lastReinforced = nowIso();
     }
+
+    // 간격 게이트가 닫혀 있으면 저장강도가 안 오르므로, 디스크에 반영할 실질 변화가
+    // accessCount/lastAccessed 뿐이다. 이 둘은 활성 계산에 쓰이지 않는 표시용 필드인데
+    // 매 조회마다 파일을 통째로 재직렬화하면 git/Obsidian/백업이 조회만으로 변경을
+    // 감지하고, 비원자 구간을 불필요하게 자주 연다(감사 B). 게이트가 열릴 때 함께
+    // 반영되므로 여기서는 쓰기를 생략한다.
+    if (delta === 0 && !FLUSH_EVERY_ACCESS) return;
 
     try {
       // 현재 디스크 상태를 다시 읽는다 — 위치(memories/archive)도 여기서 재확인된다.

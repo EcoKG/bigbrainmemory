@@ -40,12 +40,29 @@ function freshDir() {
 const memPath = (dir, slug) => path.join(dir, "memories", `${slug}.md`);
 const arcPath = (dir, slug) => path.join(dir, "archive", `${slug}.md`);
 
+/** last_reinforced 를 과거로 되감아 간격 게이트를 연다 (강화가 실제로 기록되게) */
+function openGate(dir, slug) {
+  const fp = memPath(dir, slug);
+  if (!fs.existsSync(fp)) return;
+  const past = new Date(Date.now() - 3600_000).toISOString();
+  fs.writeFileSync(fp, fs.readFileSync(fp, "utf-8").replace(/last_reinforced: .*/, `last_reinforced: '${past}'`), "utf-8");
+}
+/** 파일에서 access_count 를 직접 읽는다 (store.read 의 부수효과 없이) */
+function diskAccessCount(dir, slug) {
+  const fp = fs.existsSync(memPath(dir, slug)) ? memPath(dir, slug) : arcPath(dir, slug);
+  return Number(/access_count: (\d+)/.exec(fs.readFileSync(fp, "utf-8"))?.[1] ?? -1);
+}
+
 /**
  * 경쟁 창을 결정적으로 재현한다.
  * A 가 레코드를 읽은 **직후·강화 기록 전에** B 의 변이를 착지시킨다.
  * (search 의 loadAll 스냅샷 → 다른 프로세스 변이 → 강화 write-back 과 동일 구조)
  */
 function raceOnce(dir, slug, mutate) {
+  // 간격 게이트를 연다. T11 이후 게이트가 닫혀 있으면 reinforce 가 아예 쓰지 않으므로
+  // 경쟁 자체가 성립하지 않아 테스트가 공허해진다 — 실제로 write-back 이 일어나는
+  // 위험한 경로를 검증해야 A4 회귀를 잡을 수 있다.
+  openGate(dir, slug);
   const vaultA = new Vault(dir);
   const storeA = new MemoryStore(vaultA);
   const origFind = vaultA.find.bind(vaultA);
@@ -139,7 +156,8 @@ console.log("4) 2프로세스 동시 recall — 강화 소실률 (A4)");
   const dir = freshDir();
   const seed = new MemoryStore(new Vault(dir));
   const rec = seed.remember({ title: "경합 카운터", content: "퀘벡 로미오 경합 대상.", type: "semantic" }).record;
-  const baseline = seed.read(rec.slug).accessCount; // seed 자신의 1회
+  // 부모 쪽 store.read 는 부수효과가 있으므로 파일에서 직접 읽는다
+  const baseline = diskAccessCount(dir, rec.slug);
 
   const N = 300;
   const child = path.join(dir, "child.mjs");
@@ -160,8 +178,8 @@ for (let i = 0; i < ${N}; i++) s.search("퀘벡");
   const elapsed = Date.now() - t0;
   check("자식 프로세스 2개 정상 종료", kids.every((k) => k.status === 0), kids.map((k) => k.stderr?.slice(0, 200)).join(" | "));
 
-  const final = new MemoryStore(new Vault(dir)).read(rec.slug).accessCount;
-  const expected = baseline + 2 * N + 1; // +1 은 방금 read
+  const final = diskAccessCount(dir, rec.slug);
+  const expected = baseline + 2 * N;
   const lost = expected - final;
   const lossRate = (lost / (2 * N)) * 100;
   console.log(`    기대 ${expected} / 실측 ${final} / 소실 ${lost} (${lossRate.toFixed(1)}%, ${elapsed}ms)`);

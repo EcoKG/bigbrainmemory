@@ -290,8 +290,22 @@ export class Vault {
     if (fs.existsSync(from)) fs.renameSync(from, to);
   }
 
+  /**
+   * 인덱스는 **내용이 실제로 달라졌을 때만** 쓴다 (감사 B).
+   * 예전에는 본문에 생성 시각을 박아 내용이 같아도 매번 바이트가 달라졌고,
+   * 서버 기동 시마다 호출되므로 MCP 클라이언트를 켜기만 해도 diff 가 생겼다.
+   */
   writeIndex(markdown: string): void {
-    writeFileAtomic(path.join(this.root, "MEMORY.md"), markdown);
+    const fp = path.join(this.root, "MEMORY.md");
+    try {
+      if (fs.existsSync(fp) && fs.readFileSync(fp, "utf-8") === markdown) {
+        this.markVault();
+        return;
+      }
+    } catch {
+      /* 비교 실패 시에는 그냥 쓴다 */
+    }
+    writeFileAtomic(fp, markdown);
     this.markVault();
   }
 
