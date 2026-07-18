@@ -132,6 +132,7 @@ export class MemoryStore {
       lastReinforced: now,
       accessCount: 0,
       source: input.source,
+      project: input.project,
       links: [],
       history: [`${today()}: created${input.source ? ` (source: ${input.source})` : ""}`],
       body: input.content.trim(),
@@ -179,7 +180,20 @@ export class MemoryStore {
    * 회상은 능동 인출로 간주해 상위 기억을 강화하고(P4),
    * 같은 클러스터의 경쟁 유사 기억은 순위에서만 완만히 억제한다(P5, RIF).
    */
-  search(query: string, opts?: { type?: MemoryType; limit?: number; includeLinked?: boolean }): SearchResult[] {
+  /**
+   * 프로젝트 스코프 필터 (감사 E2).
+   * `project` 가 없는 기억은 **전역**이라 어느 프로젝트에서도 통과한다.
+   * opts.project 가 없으면 필터 자체를 적용하지 않는다(전체 조회).
+   */
+  private inScope(m: MemoryRecord, project?: string): boolean {
+    if (!project) return true;
+    return !m.project || m.project === project;
+  }
+
+  search(
+    query: string,
+    opts?: { type?: MemoryType; limit?: number; includeLinked?: boolean; project?: string },
+  ): SearchResult[] {
     const tokens = tokenize(query);
     if (tokens.length === 0) return [];
     const limit = opts?.limit ?? 5;
@@ -189,6 +203,7 @@ export class MemoryStore {
     const scored: SearchResult[] = [];
     for (const m of all) {
       if (opts?.type && m.type !== opts.type) continue;
+      if (!this.inScope(m, opts?.project)) continue;
       let keyword = 0;
       const title = m.title.toLowerCase();
       const desc = m.description.toLowerCase();
@@ -243,7 +258,8 @@ export class MemoryStore {
         for (const linkSlug of r.record.links) {
           if (have.has(linkSlug)) continue;
           const found = this.vault.find(linkSlug);
-          if (found && found.record.status === "active") {
+          // 연상으로도 스코프 밖 기억이 새어 들어오면 안 된다
+          if (found && found.record.status === "active" && this.inScope(found.record, opts?.project)) {
             have.add(linkSlug);
             const act = baseLevelActivation(found.record.storageStrength, now - Date.parse(found.record.created));
             assoc.push({
@@ -295,6 +311,7 @@ export class MemoryStore {
     if (input.tags !== undefined) m.tags = input.tags;
     if (input.confidence !== undefined) m.confidence = Math.min(1, Math.max(0, input.confidence));
     if (input.source !== undefined) m.source = input.source;
+    if (input.project !== undefined) m.project = input.project || undefined; // 빈 문자열 = 전역으로 되돌리기
     this.ensureBodyLinks(m); // 본문 교체로 연상 링크가 소실되지 않도록 복원
     // 재공고화: 재확인/갱신은 기억을 강화하고 최근성 시계를 갱신
     m.storageStrength += 1;
@@ -387,10 +404,11 @@ export class MemoryStore {
     return { counts: { total: all.length, byType, byStatus }, weakened, forgetCandidates, lowConfidence, duplicates, orphans };
   }
 
-  list(opts?: { type?: MemoryType; status?: MemoryStatus }): MemoryRecord[] {
+  list(opts?: { type?: MemoryType; status?: MemoryStatus; project?: string }): MemoryRecord[] {
     return this.loadAll(true)
       .filter((m) => (opts?.type ? m.type === opts.type : true))
       .filter((m) => (opts?.status ? m.status === opts.status : m.status === "active"))
+      .filter((m) => this.inScope(m, opts?.project))
       .sort((a, b) => Date.parse(b.updated) - Date.parse(a.updated));
   }
 

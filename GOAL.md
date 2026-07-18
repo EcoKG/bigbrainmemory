@@ -87,7 +87,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
   - 어떻게: ① index.ts 기동 시 instructions 끝에 `store.list().slice(0,40).map(m => '- ['+m.type+'] '+m.title+' — '+m.description)` 부착 ② 사용자 확인 후 Claude Code `SessionStart` 훅 등록 — `vault/MEMORY.md` 를 stdout 출력 (머신 설정 — 공통 규칙 7) ③ 브리지 파일(네이티브 memory/MEMORY.md) 패턴을 README 에 공식 문서화.
   - 검증: 새 세션에서 시스템 컨텍스트에 인덱스 항목이 보이는지 실확인 (①은 /mcp 재연결로, ②는 새 세션으로).
 
-- [ ] **T8. 프로젝트 스코핑** (E2, 대체 전략 ②)
+- [x] **T8. 프로젝트 스코핑** (E2, 대체 전략 ②) — 완료 2026-07-18
   - 무엇: 전역 단일 볼트에 recall/list 하드 필터가 없다 — 타 프로젝트 기억이 동점 1위로 끼어든다 (재현 확정, tags 는 가산점일 뿐 배제 불가).
   - 왜: high — 볼트가 다프로젝트로 성장하면 정밀도 단조 하락. 볼트 분리안은 교차 공유(BBM 존재 이유)를 죽여서 기각.
   - 어떻게: types.ts `project?: string` → vault.ts 직렬화/파싱(기본값 undefined = 전역) → store.search/list 에 `opts.project` 필터 `!m.project || m.project === opts.project` → index.ts remember/recall/list 스키마에 project 추가 → env `BIGBRAIN_PROJECT` 로 서버 기본값.
@@ -163,6 +163,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
 |---|---|---|
 | 2026-07-18 | 감사 완료 (47건 확정) + 본 계획 수립 | docs/native-parity-audit.md |
 | 2026-07-18 | 네이티브 5건 이관 + 브리지 전환 (SimpleMailServer) | 대체 전략 ④ 실증 |
+| 2026-07-18 | **T8** 프로젝트 스코핑 | `project?: string` 필드 + `inScope()` 필터(`!m.project \|\| m.project === scope`) 를 search·연상확산·list 에 적용, remember/recall/list/revise 스키마에 노출, `BIGBRAIN_PROJECT` 서버 기본값. **계획 대비 판단**: remember 에서 `project` 생략 시 서버 스코프를 **몰래 씌우지 않음** — 씌우면 "전역이면 생략" 이라는 도구 설명과 모순되고 사용자 선호 같은 범용 지식이 한 프로젝트에 갇혀 조용히 회상되지 않는다. 대신 instructions 에 현재 스코프와 저장 지침을 실어 모델이 명시적으로 판단하게 함. 회귀 `scripts/regress-scoping.mjs` 신설(24건, 구버전 노트 하위 호환·연상 누수 차단·MCP 계층 포함) — 전체 155✔/0✘ |
 | 2026-07-18 | **T7** 회상 트리거 삼중화 | ① `memoryIndexLines()` 가 기동 시 기억 인덱스(제목+설명+타입)를 instructions 에 부착, `BIGBRAIN_INDEX_LIMIT`(기본 40) 상한·총건수 안내·빈 볼트 명시. ② **사용자 승인 후** `~/.claude/settings.json` 에 SessionStart 훅 추가 — `vault/MEMORY.md` 를 `<bigbrainmemory-index>` 태그로 감싸 주입(`head -c 8000` 상한). 기존 Orca 훅 10종 무변경, 백업 `settings.json.bak-bbm-20260718`. 실제 실행해 3,224자 출력 확인. ③ README 에 3중 채널 문서화 + 죽은 `D:/` 경로 정리. 회귀 `scripts/regress-trigger.mjs` 신설(12건, `client.getInstructions()` 로 실제 스폰 검증) — 전체 131✔/0✘ |
 | 2026-07-18 | **P0 완료** — 데이터 안전 6/6 | T1~T6 전부 통과. 회귀 테스트 4종 118✔/0✘ 로 감사 재현 시나리오 고정 |
 | 2026-07-18 | **T6** revise 구본 스냅샷 | `vault.snapshotRevision()` — 덮어쓰기 전 `archive/revisions/<slug>.<ts>.md` 로 복사, slug 당 최근 3세대 유지(사전순=시간순 정렬로 만료). **내용이 실제로 바뀔 때만** 스냅샷(재확인 revise 는 낭비 안 함). 같은 밀리초 충돌 시 접미로 회피. 스냅샷 실패는 교정을 막지 않음(경고만). `listSlugs` 가 archive 를 재귀 탐색하지 않아 기억 목록·검색·reflect 에 안 섞임을 테스트로 고정. README 에 볼트 git 백업 권고 + 디렉터리 구조 갱신. 회귀 3·4절 추가 — 전체 118✔/0✘ |

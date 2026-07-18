@@ -105,6 +105,35 @@ claude mcp add --scope user bigbrainmemory -- node <저장소경로>/dist/index.
 claude mcp add --scope user -e BIGBRAIN_VAULT="C:/Users/me/MyObsidianVault/BigBrain" bigbrainmemory -- node <저장소경로>/dist/index.js
 ```
 
+## 프로젝트 스코핑 — 격리와 공유를 함께
+
+기억은 하나의 볼트에 모이지만, 프로젝트별로 갈라 볼 수 있습니다.
+
+- **`project` 없는 기억 = 전역** — 어느 프로젝트에서도 회상됩니다. 사용자 선호, 일반 워크플로처럼 따라다녀야 할 지식에 씁니다.
+- **`project` 있는 기억 = 해당 프로젝트 전용** — 다른 프로젝트의 회상을 오염시키지 않습니다.
+- `recall`/`list_memories` 는 **그 프로젝트 기억 + 전역 기억**을 반환합니다.
+
+프로젝트별 `.mcp.json` 에 기본 스코프를 지정하면 매번 인자를 넘길 필요가 없습니다:
+
+```json
+{
+  "mcpServers": {
+    "bigbrainmemory": {
+      "command": "node",
+      "args": ["<저장소경로>/dist/index.js"],
+      "env": { "BIGBRAIN_PROJECT": "my-app" }
+    }
+  }
+}
+```
+
+- 스코프가 지정되면 서버 instructions 에 현재 스코프와 저장 지침이 함께 실립니다.
+- 전체 프로젝트를 뒤지려면 `recall` 에 `project: ""` 를 넘깁니다.
+- `BIGBRAIN_PROJECT` 를 지정하지 않으면 종전처럼 전체가 조회됩니다.
+
+볼트를 프로젝트마다 따로 두는 방법(`BIGBRAIN_VAULT` 분리)도 있지만, 그러면
+교차 프로젝트 지식을 공유할 수 없습니다 — 그게 이 서버를 쓰는 이유이므로 권장하지 않습니다.
+
 ## 회상 트리거 — "무엇이 저장돼 있는지" 알리기
 
 저장해도 **꺼내 쓰지 않으면 없는 것과 같습니다.** MCP 서버에는 자동 호출 장치가 없어서

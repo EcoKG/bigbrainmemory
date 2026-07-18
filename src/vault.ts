@@ -187,6 +187,7 @@ export class Vault {
       history: record.history,
     };
     if (record.source) fm.source = record.source;
+    if (record.project) fm.project = record.project;
     if (record.supersedes) fm.supersedes = record.supersedes;
     if (record.supersededBy) fm.superseded_by = record.supersededBy;
     if (record.archiveReason) fm.archive_reason = record.archiveReason;
@@ -344,6 +345,8 @@ export class Vault {
       lastReinforced: str(data.last_reinforced, created),
       accessCount: num(data.access_count, 0),
       source: str(data.source) || undefined,
+      // 구버전 노트에는 없는 필드 — 없으면 전역 기억으로 취급한다(하위 호환)
+      project: str(data.project) || undefined,
       links: arr(data.links),
       supersedes: str(data.supersedes) || undefined,
       supersededBy: str(data.superseded_by) || undefined,

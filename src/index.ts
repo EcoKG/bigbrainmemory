@@ -25,6 +25,13 @@ const MEMORY_TYPE = z
 const INDEX_LIMIT = Number(process.env.BIGBRAIN_INDEX_LIMIT) || 40;
 
 /**
+ * 이 서버 인스턴스의 기본 프로젝트 스코프 (감사 E2).
+ * 프로젝트별 .mcp.json 의 env 로 지정하면 그 프로젝트의 기억만 + 전역 기억이 회상된다.
+ * 미지정이면 스코프 필터를 걸지 않는다(= 종전과 동일하게 전체 조회).
+ */
+const DEFAULT_PROJECT = process.env.BIGBRAIN_PROJECT?.trim() || undefined;
+
+/**
  * 서버 기동 시점의 기억 인덱스를 instructions 에 덧붙인다 (감사 E1).
  *
  * 네이티브 메모리는 MEMORY.md 내용 자체가 매 세션 시스템 프롬프트에 주입돼
@@ -40,7 +47,7 @@ const INDEX_LIMIT = Number(process.env.BIGBRAIN_INDEX_LIMIT) || 40;
 function memoryIndexLines(): string[] {
   let items: ReturnType<typeof store.list>;
   try {
-    items = store.list();
+    items = store.list(DEFAULT_PROJECT ? { project: DEFAULT_PROJECT } : undefined);
   } catch (err) {
     console.error(
       `[BigBrainMemory] 인덱스 요약 생략(계속 진행): ${err instanceof Error ? err.message : String(err)}`,
@@ -50,12 +57,20 @@ function memoryIndexLines(): string[] {
   if (items.length === 0) {
     return ["", "The vault is currently EMPTY — no memories stored yet. Use `remember` as you learn durable facts."];
   }
+  const scope = DEFAULT_PROJECT
+    ? [
+        "",
+        `Current project scope: "${DEFAULT_PROJECT}". Recall returns this project's memories plus global ones.`,
+        `When storing, set \`project: "${DEFAULT_PROJECT}"\` for facts that only apply here; omit \`project\` for knowledge that should follow the user everywhere (preferences, general workflows).`,
+      ]
+    : [];
   const shown = items.slice(0, INDEX_LIMIT);
   const head =
     items.length > shown.length
       ? `Vault index — ${items.length} memories stored, ${shown.length} most recently updated shown. Use \`recall\` for the full text and anything not listed:`
       : `Vault index — ${items.length} memories currently stored. Use \`recall\` to read the full text:`;
   return [
+    ...scope,
     "",
     head,
     ...shown.map((m) => `- [${m.type}] ${m.title} — ${m.description}`),
@@ -93,6 +108,7 @@ function brief(m: MemoryRecord): Record<string, unknown> {
     status: m.status,
     access_count: m.accessCount,
     source: m.source,
+    project: m.project,
     links: m.links,
   };
 }
@@ -144,10 +160,19 @@ server.registerTool(
         .string()
         .optional()
         .describe("Where this came from (e.g. 'user stated', 'inferred from code', 'docs/x.md'). Recorded to prevent source confusion."),
+      project: z
+        .string()
+        .optional()
+        .describe(
+          "Project this memory belongs to. OMIT for knowledge that applies everywhere (user preferences, general workflows) — those stay globally recallable. Set it for project-specific facts so other projects are not polluted.",
+        ),
       supersedes: z.string().optional().describe("Slug or id of an outdated memory this one replaces"),
     },
   },
   async (args) => {
+    // project 를 생략하면 전역 기억이다 — 서버 스코프를 몰래 씌우지 않는다.
+    // (씌우면 "전역이면 생략" 이라는 도구 설명과 모순되고, 사용자 선호 같은
+    //  범용 지식이 한 프로젝트에 갇혀 다른 곳에서 조용히 회상되지 않는다)
     const { record, similar } = store.remember(args);
     return ok({
       stored: brief(record),
@@ -172,10 +197,17 @@ server.registerTool(
       type: MEMORY_TYPE.optional(),
       limit: z.number().int().min(1).max(20).optional().describe("Max direct results (default 5)"),
       include_linked: z.boolean().optional().describe("Also surface 1-hop linked memories as associations (default true)"),
+      project: z
+        .string()
+        .optional()
+        .describe(
+          "Restrict to this project's memories plus global ones. Defaults to the server's BIGBRAIN_PROJECT. Pass an empty string to search every project.",
+        ),
     },
   },
-  async ({ query, type, limit, include_linked }) => {
-    const results = store.search(query, { type, limit, includeLinked: include_linked });
+  async ({ query, type, limit, include_linked, project }) => {
+    const scope = project === undefined ? DEFAULT_PROJECT : project || undefined;
+    const results = store.search(query, { type, limit, includeLinked: include_linked, project: scope });
     if (results.length === 0) return ok({ results: [], note: "No memories matched. Consider `remember` if you learn something durable here." });
     return ok({ results: results.map(searchHit) });
   },
@@ -211,10 +243,14 @@ server.registerTool(
       tags: z.array(z.string()).optional(),
       confidence: z.number().min(0).max(1).optional().describe("New truthfulness score (0-1)"),
       source: z.string().optional().describe("Updated provenance for this memory"),
+      project: z
+        .string()
+        .optional()
+        .describe("Reassign project scope. Pass an empty string to make the memory global again."),
     },
   },
-  async ({ id, reason, content, title, description, tags, confidence, source }) => {
-    const m = store.revise(id, { reason, content, title, description, tags, confidence, source });
+  async ({ id, reason, content, title, description, tags, confidence, source, project }) => {
+    const m = store.revise(id, { reason, content, title, description, tags, confidence, source, project });
     if (!m) return fail(`Memory not found: ${id}`);
     return ok({ revised: full(m) });
   },
@@ -291,10 +327,17 @@ server.registerTool(
     inputSchema: {
       type: MEMORY_TYPE.optional(),
       status: z.enum(["active", "superseded", "archived"]).optional().describe("Filter by status (default: active)"),
+      project: z
+        .string()
+        .optional()
+        .describe(
+          "Restrict to this project's memories plus global ones. Defaults to the server's BIGBRAIN_PROJECT. Pass an empty string to list every project.",
+        ),
     },
   },
-  async ({ type, status }) => {
-    const items = store.list({ type, status });
+  async ({ type, status, project }) => {
+    const scope = project === undefined ? DEFAULT_PROJECT : project || undefined;
+    const items = store.list({ type, status, project: scope });
     return ok({ count: items.length, memories: items.map(brief) });
   },
 );
