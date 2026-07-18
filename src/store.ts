@@ -42,6 +42,14 @@ const HARD_RETRIEVAL_ACTIVATION = 0.5 - Math.log(1 / (1 - 0.5)); // ≈ -0.193
  * 접근수 통계를 정확히 원하면 BIGBRAIN_FLUSH_EVERY_ACCESS=1 로 켠다.
  */
 const FLUSH_EVERY_ACCESS = /^(1|true|yes)$/i.test(process.env.BIGBRAIN_FLUSH_EVERY_ACCESS ?? "");
+/**
+ * 확장 간격 계수 (P3, 감사 C3). 필요 간격이 `α · 나이 / n` 으로 늘어난다.
+ * 0 이면 종전의 고정 창 동작. 기본 0.1 = 나이의 10% 를 n 으로 나눈 만큼.
+ */
+const SPACING_ALPHA = (() => {
+  const v = Number(process.env.BIGBRAIN_SPACING_ALPHA);
+  return Number.isFinite(v) && v >= 0 ? v : 0.1;
+})();
 /** reflect 의 weakened 유예기간 — 이보다 어린 기억은 "약해졌다" 고 보지 않는다 (P6, 감사 C2) */
 const WEAKENED_GRACE_MS = (() => {
   const v = Number(process.env.BIGBRAIN_WEAKENED_GRACE_H);
@@ -118,6 +126,27 @@ function baseLevelActivation(storageStrength: number, ageMs: number, sinceLastRe
   const tLast = Math.max(raw, 60_000) / HOUR_MS;
   const tail = ((n - 1) * L ** -DECAY_D) / (1 - DECAY_D);
   return Math.log(tail + tLast ** -DECAY_D);
+}
+
+/**
+ * 다음 강화까지 필요한 간격 — **확장 간격**(expanding spacing, 감사 C3).
+ *
+ * 종전에는 고정 10분 창이라 "10분짜리 벼락치기" 가 그대로 통과했다:
+ * 11분 주기로 기계적으로 recall 하면 회당 +1 씩 상한 없이 부풀릴 수 있었고
+ * (실측 30회 → 저장강도 1→31), 저장강도는 감소 경로가 없어 그 값이 영구히 남는다.
+ * 하루 144회면 n=145 가 되어 그 기억은 reflect 의 weakened 에서 수십 년간 면제된다.
+ * 간격효과 이론이 요구하는 것은 **간격의 확대**이지 고정 rate limit 이 아니다.
+ *
+ * 필요 간격 = max(기본창, α · 기억의 나이 / n).
+ * 이미 n 번 강화된 기억은 그만큼 더 긴 간격을 요구하므로, 반복 질의로 강도를
+ * 무한히 끌어올릴 수 없다. ACT-R 의 합리적 분석(연습 간격이 기억의 생애에 비례해
+ * 벌어진다)과도 정합적이다.
+ */
+function requiredSpacing(m: MemoryRecord, now: number): number {
+  const ageMs = Math.max(0, now - Date.parse(m.created));
+  const n = Math.max(1, m.storageStrength);
+  const expanding = (SPACING_ALPHA * ageMs) / n;
+  return Math.max(SPACING_WINDOW_MS, expanding);
 }
 
 /** 레코드로부터 기저활성을 계산 — 감쇠 시계 인자를 한 곳에서만 조립한다 */
@@ -528,7 +557,7 @@ export class MemoryStore {
   private reinforce(m: MemoryRecord, opts: { active: boolean; preActivation: number }): void {
     const now = Date.now();
     const sinceReinforce = now - Date.parse(m.lastReinforced);
-    const gateOpen = sinceReinforce >= SPACING_WINDOW_MS;
+    const gateOpen = sinceReinforce >= requiredSpacing(m, now);
     let delta = 0;
     if (gateOpen) {
       delta = opts.active ? 1 : 0.5; // 검사효과: 능동 인출 > 수동 열람

@@ -115,23 +115,24 @@ console.log("3) reflect 오분류 해소");
 // ── 4. P4 '바람직한 어려움' 보너스가 최근 강화 기억에는 안 붙는다 (C4 자동 해소)
 console.log("4) 어려움 보너스 오발동 해소 (C4)");
 {
-  function deltaAfterSearch({ reinforcedAgoHours }) {
+  function deltaAfterSearch(shapeOpts) {
     const dir = freshDir();
     const s = new MemoryStore(new Vault(dir));
     s.remember({ title: "호텔 보너스 대상", content: "호텔 인디아 본문.", type: "semantic" });
-    shape(dir, "호텔-보너스-대상", { agoHours: 7 * 24, strength: 5, reinforcedAgoHours });
+    shape(dir, "호텔-보너스-대상", shapeOpts);
     const before = Number(/storage_strength: ([\d.]+)/.exec(fs.readFileSync(memPath(dir, "호텔-보너스-대상"), "utf-8"))[1]);
     new MemoryStore(new Vault(dir)).search("호텔");
     const after = Number(/storage_strength: ([\d.]+)/.exec(fs.readFileSync(memPath(dir, "호텔-보너스-대상"), "utf-8"))[1]);
     return after - before;
   }
-  // 핵심: **동일한 created·n 인데 마지막 강화 시점만 다르면** 보너스 판정이 갈려야 한다.
-  // 종전에는 감쇠 시계가 created 고정이라 두 경우가 항상 같은 판정을 받았다(C4).
-  const recent = deltaAfterSearch({ reinforcedAgoHours: 2 });
-  const stale = deltaAfterSearch({ reinforcedAgoHours: YEAR_H });
-  check("방금 강화한 기억은 delta 1 (보너스 미발동)", recent === 1, `delta=${recent}`);
+  // 핵심: 마지막 강화가 최근이면 활성이 높아 "어렵게 찾은 회상" 이 아니다.
+  // 종전에는 감쇠 시계가 created 고정이라 최근성이 판정에 전혀 반영되지 않았다(C4).
+  // 두 시나리오 모두 확장 간격 게이트(T14)는 열려 있도록 잡았다 — 그래야 delta 를 관측할 수 있다.
+  const recent = deltaAfterSearch({ agoHours: 24, strength: 10, reinforcedAgoHours: 20 / 60 });
+  const stale = deltaAfterSearch({ agoHours: YEAR_H, strength: 5, reinforcedAgoHours: YEAR_H });
+  check("최근 강화 기억은 delta 1 (보너스 미발동)", recent === 1, `delta=${recent}`);
   check("장기 방치 기억은 delta 1.5 (보너스 발동)", stale === 1.5, `delta=${stale}`);
-  check("최근성만 다른데 판정이 갈림 (C4 해소)", recent !== stale, `${recent} vs ${stale}`);
+  check("최근성에 따라 판정이 갈림 (C4 해소)", recent !== stale, `${recent} vs ${stale}`);
 }
 
 // ── 5. n=1 은 정확식과 일치한다
