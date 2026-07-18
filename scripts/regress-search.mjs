@@ -136,10 +136,89 @@ console.log("7) 직접 매칭 시 폴백 미작동");
   check("점수가 폴백 수준(1.5×)이 아닌 정상 키워드 점수", r[0].score > 3, `score=${r[0]?.score}`);
 }
 
+// ── 8. 토큰 경계 — 'cat' 이 concatenate 를 잡지 않는다 (D4)
+console.log("8) 토큰 경계 오탐 차단 (D4)");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  s.remember({ title: "Concatenation helpers", description: "string joining", content: "concat and concatenate utilities.", type: "semantic" });
+  s.remember({ title: "문자열 유틸 정리", description: "category 분류", content: "concatenate, concat, category 정리.", type: "semantic" });
+  const r = new MemoryStore(new Vault(dir)).search("cat");
+  check("'cat' 이 concatenate/category 를 끌어오지 않음 (종전 2건 7.68/3.84)", r.length === 0, slugs(r).join(","));
+}
+
+// ── 9. 조사 흡수는 유지 (한국어 회수율 보존)
+console.log("9) 조사 흡수 유지");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  s.remember({ title: "배포 모드 설명", description: "모드 종류", content: "프로덕션 모드 본문.", type: "semantic" });
+  const q = new MemoryStore(new Vault(dir));
+  check("'모드를' 로 검색해도 '모드' 기억을 찾음", slugs(q.search("모드를")).includes("배포-모드-설명"), slugs(q.search("모드를")).join(","));
+  check("'배포는' 도 동작", slugs(q.search("배포는")).includes("배포-모드-설명"));
+}
+
+// ── 10. 단어 경계 — 서버리스/서버, 인증서/인증 오탐 차단 (D3)
+console.log("10) 접두 오탐 차단 (D3)");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  const first = s.remember({
+    title: "서버 성능 튜닝",
+    description: "물리 서버 CPU 메모리 조정 방법",
+    content: "물리 장비 튜닝 절차.",
+    type: "procedural",
+  });
+  const second = s.remember({
+    title: "서버리스 비용 분석",
+    description: "람다 함수 호출당 과금 계산",
+    content: "서버리스 요금 구조.",
+    type: "semantic",
+  });
+  check("'서버리스 비용' 이 '서버 성능' 을 similar 로 오보고하지 않음", second.similar.length === 0, second.similar.map((m) => m.slug).join(","));
+  check("(전제) 첫 기억은 정상 저장됨", !!first.record.slug);
+
+  const r = new MemoryStore(new Vault(dir)).search("성능 비용");
+  const inhibited = r.filter((x) => x.inhibited).map((x) => x.record.slug);
+  check("무관한 두 기억이 RIF 로 서로 억제되지 않음", inhibited.length === 0, inhibited.join(","));
+}
+
+// ── 11. 짧은 제목 메모가 볼트 전체를 억제하지 않는다 (D3 min 분모 문제)
+console.log("11) 희소 토큰 대량 억제 차단 (D3)");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  s.remember({ title: "빌드", description: "빌드", content: "빌드", type: "episodic" }); // 극단적으로 짧은 메모
+  s.remember({ title: "인스톨러 서명 빌드", description: "코드 서명 절차", content: "인증서로 서명한다.", type: "procedural" });
+  s.remember({ title: "CI 캐시 빌드", description: "캐시 전략", content: "레이어 캐시를 쓴다.", type: "procedural" });
+  s.remember({ title: "도커 멀티스테이지 빌드", description: "이미지 축소", content: "멀티스테이지로 줄인다.", type: "procedural" });
+
+  const r = new MemoryStore(new Vault(dir)).search("빌드");
+  const inhibited = r.filter((x) => x.inhibited).map((x) => x.record.slug);
+  check("서로 다른 주제의 빌드 문서가 억제되지 않음 (종전 3건 반토막)", inhibited.length === 0, inhibited.join(","));
+  check("네 건 모두 회상됨", r.length === 4, `len=${r.length}`);
+}
+
+// ── 12. 진짜 근접 중복은 여전히 잡는다 (P5 기능 보존)
+console.log("12) 진짜 중복은 계속 탐지");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  s.remember({ title: "타입스크립트 strict 모드 선호", description: "코드 리뷰에서 strict true 를 요구함", content: "본문 A.", type: "preference" });
+  const dup = s.remember({ title: "타입스크립트 strict 모드 선호함", description: "코드 리뷰에서 strict true 를 요구함", content: "본문 B.", type: "preference" });
+  check("근접 중복은 similar 로 보고됨", dup.similar.length >= 1, dup.similar.map((m) => m.slug).join(","));
+
+  const rep = new MemoryStore(new Vault(dir)).reflect();
+  check("reflect 의 중복 후보로도 잡힘", rep.duplicates.length >= 1, JSON.stringify(rep.duplicates));
+
+  const r = new MemoryStore(new Vault(dir)).search("타입스크립트 strict");
+  check("근접 중복은 RIF 로 억제됨 (P5 유지)", r.some((x) => x.inhibited), r.map((x) => `${x.record.slug}:${x.inhibited}`).join(","));
+}
+
 for (const d of cleanups) fs.rmSync(d, { recursive: true, force: true });
 
 if (failures > 0) {
   console.error(`\n실패: ${failures}건`);
   process.exit(1);
 }
-console.log("\nT15 검색 확장 회귀 테스트 통과 ✔");
+console.log("\nT15/T16 검색 확장·정밀화 회귀 테스트 통과 ✔");

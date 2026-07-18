@@ -42,6 +42,15 @@ const HARD_RETRIEVAL_ACTIVATION = 0.5 - Math.log(1 / (1 - 0.5)); // ≈ -0.193
  * 접근수 통계를 정확히 원하면 BIGBRAIN_FLUSH_EVERY_ACCESS=1 로 켠다.
  */
 const FLUSH_EVERY_ACCESS = /^(1|true|yes)$/i.test(process.env.BIGBRAIN_FLUSH_EVERY_ACCESS ?? "");
+/**
+ * overlap 임계 3종 (감사 D3). 분모를 min → 자카드로 바꾸면서 함께 재보정했다.
+ * 같은 크기 집합 기준 환산: min 0.45→0.29, 0.5→0.33, 0.75→0.60.
+ */
+const SIMILAR_THRESHOLD = 0.3; // remember 의 유사 기억 보고 (종전 0.45)
+const RIF_THRESHOLD = 0.35; // 회상 순위 측면억제 (종전 0.5)
+const DUPLICATE_THRESHOLD = 0.6; // reflect 의 중복 후보 (종전 0.75)
+/** 이보다 토큰이 적은 집합은 유사도 판단 근거가 부족하다고 보고 비교하지 않는다 */
+const MIN_OVERLAP_TOKENS = 3;
 /** 동의어로만 맞은 토큰의 가중 — 정확히 일치한 기억이 여전히 위로 오게 한다 (감사 D1) */
 const SYNONYM_WEIGHT = 0.6;
 /** 직접 매칭 0건일 때 쓰는 2차(느슨한 접두) 패스의 토큰당 점수 (감사 D2) */
@@ -150,19 +159,61 @@ function expandTokens(tokens: string[]): string[] {
   return [...out];
 }
 
-/** 한국어 조사/어미 변화를 흡수하기 위한 접두 일치 ("모드를" ≈ "모드") */
-function tokenMatch(a: string, b: string): boolean {
-  return a === b || a.startsWith(b) || b.startsWith(a);
+/** 한국어 조사 — 긴 것부터 (부분 스트립 방지) */
+const PARTICLES = [
+  "으로서", "으로써", "에게서", "이라도", "으로", "에서", "부터", "까지", "에게", "한테",
+  "보다", "처럼", "이나", "라도", "조차", "마저", "밖에", "라는", "이란",
+  "을", "를", "이", "가", "은", "는", "에", "의", "로", "와", "과", "도", "만", "나",
+];
+
+/** 조사를 떼어낸 어간. 남는 길이가 2 미만이면 원형을 유지한다 */
+function stripParticle(t: string): string {
+  for (const p of PARTICLES) {
+    if (t.length - p.length >= 2 && t.endsWith(p)) return t.slice(0, -p.length);
+  }
+  return t;
 }
 
-/** overlap 계수 — 짧은 쪽 집합 대비 겹침 비율 */
+/**
+ * 토큰 동일성 — 조사 변화를 흡수하되 **단어 경계는 지킨다** ("모드를" ≈ "모드").
+ *
+ * 종전에는 무제한 양방향 접두 일치라 단어 경계 개념이 없었다(감사 D3):
+ * "서버리스"≈"서버", "인증서"≈"인증", "부산물"≈"부산" 이 모두 참이 되어
+ * 무관한 기억이 similar 로 보고되고(→ instructions 가 revise 병합을 유도) RIF 로
+ * 순위가 반토막 났다.
+ *
+ * 흡수하려던 것은 조사뿐이므로 조사를 **명시적으로 떼어내** 비교한다.
+ * 그 밖의 복합어 접두는 짧은 쪽 3자 이상 + 길이차 2 이하일 때만 인정한다
+ * ("릴리스노트"≈"릴리스" 는 통과, "서버리스"≈"서버" 는 차단).
+ */
+function tokenMatch(a: string, b: string): boolean {
+  if (a === b) return true;
+  const na = stripParticle(a);
+  const nb = stripParticle(b);
+  if (na === nb) return true;
+  const [short, long] = na.length <= nb.length ? [na, nb] : [nb, na];
+  return short.length >= 3 && long.length - short.length <= 2 && long.startsWith(short);
+}
+
+/**
+ * overlap 계수 — **자카드**(합집합 대비 겹침).
+ *
+ * 종전 분모는 min(|A|,|B|) 라, 비교 대상 한쪽이 1~2 토큰으로 희소하기만 하면
+ * 토큰 하나만 겹쳐도 유사도가 0.5~1.0 으로 치솟았다(감사 D3). 제목이 짧은 메모 하나가
+ * 그 토큰을 공유하는 볼트 전체를 매 질의마다 RIF 로 억제하는 구조였다
+ * (실측: 무관한 빌드 문서 3건이 11.52 → 5.76 으로 반토막, overlap 1.0 vs 자카드 0.10).
+ * 자카드는 한쪽이 희소해도 부풀지 않아 "근접 중복만 누른다" 는 P5 의도에 맞다.
+ *
+ * 추가 안전장치: 비교 집합이 3 토큰 미만이면 판단 근거가 부족하므로 0 을 돌려준다.
+ */
 function overlap(a: string[], b: string[]): number {
-  if (a.length === 0 || b.length === 0) return 0;
   const sa = [...new Set(a)];
   const sb = [...new Set(b)];
+  if (sa.length < MIN_OVERLAP_TOKENS || sb.length < MIN_OVERLAP_TOKENS) return 0;
   let inter = 0;
   for (const t of sa) if (sb.some((u) => tokenMatch(t, u))) inter++;
-  return inter / Math.min(sa.length, sb.length);
+  const union = sa.length + sb.length - inter;
+  return union === 0 ? 0 : inter / union;
 }
 
 /**
@@ -295,7 +346,7 @@ export class MemoryStore {
     const titleTokens = tokenize(input.title + " " + record.description);
     const similar = this.loadAll()
       .filter((m) => m.status === "active")
-      .filter((m) => overlap(titleTokens, tokenize(m.title + " " + m.description)) >= 0.45);
+      .filter((m) => overlap(titleTokens, tokenize(m.title + " " + m.description)) >= SIMILAR_THRESHOLD);
 
     // 기존 기억 대체(supersede) — 신규 레코드 쪽 표시는 **생성 전에** 해야 본문에 직렬화된다
     const found = input.supersedes ? this.resolve(input.supersedes) : null;
@@ -376,18 +427,25 @@ export class MemoryStore {
     const scored: SearchResult[] = [];
     for (const m of candidates) {
       let keyword = 0;
-      const title = m.title.toLowerCase();
-      const desc = m.description.toLowerCase();
-      const body = m.body.toLowerCase();
-      const tags = m.tags.map((t) => t.toLowerCase());
+      // 필드를 **사전 토큰화**해 비교한다(감사 D4). 종전에는 includes/indexOf 라
+      // 토큰 경계가 없어 'cat' 질의가 Concatenation·concat·category 를 포함한
+      // 무관한 기억을 고득점(7.68/3.84)으로 끌어왔고, 반환된 결과는 능동 인출로
+      // 강화까지 받아 오탐이 시간이 갈수록 더 잘 회상되는 방향으로 드리프트했다.
+      // 조사 흡수는 tokenMatch 가 담당하므로 한국어 회수율 손실은 없다.
+      const titleT = tokenize(m.title);
+      const descT = tokenize(m.description);
+      const bodyT = tokenize(m.body);
+      const tagT = tokenize(m.tags.join(" "));
       for (const t of expanded) {
         const w = exact.has(t) ? 1 : SYNONYM_WEIGHT;
-        if (title.includes(t)) keyword += 5 * w;
-        if (tags.some((tag) => tag.includes(t))) keyword += 4 * w;
-        if (desc.includes(t)) keyword += 3 * w;
-        let idx = -1;
+        if (titleT.some((u) => tokenMatch(t, u))) keyword += 5 * w;
+        if (tagT.some((u) => tokenMatch(t, u))) keyword += 4 * w;
+        if (descT.some((u) => tokenMatch(t, u))) keyword += 3 * w;
         let hits = 0;
-        while (hits < 3 && (idx = body.indexOf(t, idx + 1)) !== -1) hits++;
+        for (const u of bodyT) {
+          if (hits >= 3) break;
+          if (tokenMatch(t, u)) hits++;
+        }
         keyword += hits * w;
       }
       if (keyword === 0) continue;
@@ -418,7 +476,7 @@ export class MemoryStore {
           overlap(
             tokenize(k.record.title + " " + k.record.description),
             tokenize(r.record.title + " " + r.record.description),
-          ) >= 0.5,
+          ) >= RIF_THRESHOLD,
       );
       if (rivalOf) {
         r.score *= 0.5;
@@ -589,7 +647,7 @@ export class MemoryStore {
           tokenize(active[i].title + " " + active[i].description),
           tokenize(active[j].title + " " + active[j].description),
         );
-        if (sim >= 0.75) duplicates.push([active[i].slug, active[j].slug]);
+        if (sim >= DUPLICATE_THRESHOLD) duplicates.push([active[i].slug, active[j].slug]);
       }
     }
     const orphans = active.filter((m) => m.links.length === 0);
