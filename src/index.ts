@@ -13,7 +13,28 @@ const vaultDir = process.env.BIGBRAIN_VAULT
   ? path.resolve(process.env.BIGBRAIN_VAULT)
   : path.resolve(here, "..", "vault");
 
-const store = new MemoryStore(new Vault(vaultDir));
+const vault = new Vault(vaultDir);
+const store = new MemoryStore(vault);
+
+/**
+ * 볼트가 "지정됐는데 비어 있고 마커도 없는" 상태면 경로 오타/드라이브 이동을 의심한다 (감사 E3).
+ * 이 경우 조용히 빈 볼트로 동작하면 모델이 "기억이 없다" 고 판단해 중복 저장을 시작하고
+ * 볼트가 두 갈래로 분열된다. stderr 와 instructions 양쪽에 경고를 띄워 사람과 모델이
+ * 모두 알아채게 한다. (BIGBRAIN_VAULT 를 지정하지 않은 첫 실행은 정상이므로 제외)
+ */
+function computeVaultWarning(): string | null {
+  const st = vault.inspect();
+  if (st.memories > 0 || st.archived > 0) return null;
+  if (!process.env.BIGBRAIN_VAULT) return null; // 기본 경로의 첫 실행 — 정상
+  if (st.hasMarker) return null; // 진짜로 비운 볼트
+  return `WARNING: BIGBRAIN_VAULT points at "${vaultDir}" but it contains no memories and no vault marker. If you expected memories here, the path may be wrong (typo, moved drive) — do NOT start storing duplicates until it is confirmed.`;
+}
+
+/**
+ * **기동 직후 한 번만** 판정한다. main() 의 regenerateIndex 가 볼트 마커를 만들기 때문에,
+ * 나중에 다시 계산하면 경고가 사라져 instructions 와 stderr 가 어긋난다.
+ */
+const VAULT_WARNING = computeVaultWarning();
 
 const MEMORY_TYPE = z
   .enum(["episodic", "semantic", "procedural", "preference"])
@@ -81,6 +102,8 @@ const server = new McpServer(
   { name: "bigbrainmemory", version: "0.1.0" },
   {
     instructions: [
+      // 경고가 있으면 맨 앞 — 모델이 빈 결과를 "기억 없음" 으로 오해하지 않도록
+      ...(VAULT_WARNING ? [VAULT_WARNING, ""] : []),
       "BigBrainMemory is a persistent, human-like memory vault (Obsidian-compatible markdown).",
       "Behave like a person with long-term memory:",
       "1. RECALL FIRST — at the start of a task, or when the user mentions past context, call `recall` before answering.",
@@ -356,7 +379,18 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // stdout은 MCP 프로토콜 전용 — 로그는 반드시 stderr로
-  console.error(`[BigBrainMemory] ready. vault=${vaultDir}`);
+  const st = vault.inspect();
+  const parts = [`memories=${st.memories}`];
+  if (st.archived > 0) parts.push(`archived=${st.archived}`);
+  if (st.quarantined > 0) parts.push(`quarantined=${st.quarantined}(!)`);
+  if (DEFAULT_PROJECT) parts.push(`project=${DEFAULT_PROJECT}`);
+  console.error(`[BigBrainMemory] ready. vault=${vaultDir} ${parts.join(" ")}`);
+  if (VAULT_WARNING) console.error(`[BigBrainMemory] ${VAULT_WARNING}`);
+  if (st.quarantined > 0) {
+    console.error(
+      `[BigBrainMemory] 격리된 손상 파일 ${st.quarantined}건이 있습니다 — vault/quarantine/ 확인 필요`,
+    );
+  }
 }
 
 main().catch((err) => {

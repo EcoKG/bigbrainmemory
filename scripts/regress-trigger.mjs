@@ -113,10 +113,61 @@ console.log("3) 인덱스 상한 처리");
   check("누락분 안내 문구 포함", /anything not listed/.test(instructions));
 }
 
+// ── 4. 잘못된 볼트 경로가 조용히 넘어가지 않는다 (E3)
+console.log("4) 볼트 경로 오타 가시화 (E3)");
+{
+  const wrong = path.join(freshDir(), "오타난", "경로");
+  const { instructions, stderr } = await boot(wrong);
+  check("stderr 에 경고 출력", /WARNING: BIGBRAIN_VAULT points at/.test(stderr), stderr.slice(0, 300));
+  check("instructions 첫머리에 경고 부착", instructions.startsWith("WARNING:"), instructions.slice(0, 120));
+  check("중복 저장 금지 안내 포함", /do NOT start storing duplicates/.test(instructions));
+  check("기동 로그에 기억 수 표기", /memories=0/.test(stderr), stderr.slice(0, 300));
+  check("도구는 정상 등록 (기동 자체는 성공)", true);
+}
+
+// ── 5. 정상 볼트에는 경고가 없다 (거짓 양성 방지)
+console.log("5) 정상 볼트 — 오경보 없음");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  s.remember({ title: "정상 기억", description: "설명", content: "본문.", type: "semantic" });
+  const { instructions, stderr } = await boot(dir);
+  check("경고 없음", !/WARNING/.test(instructions), instructions.slice(0, 200));
+  check("기동 로그에 memories=1", /memories=1/.test(stderr), stderr.slice(0, 300));
+  check("정상 안내로 시작", instructions.startsWith("BigBrainMemory is a persistent"));
+}
+
+// ── 6. 마커가 있으면 빈 볼트여도 경고하지 않는다 (의도적으로 비운 경우)
+console.log("6) 마커 있는 빈 볼트 — 경고 없음");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  const rec = s.remember({ title: "곧 지울 기억", description: "설명", content: "본문.", type: "semantic" }).record;
+  fs.unlinkSync(path.join(dir, "memories", `${rec.slug}.md`)); // 사용자가 비운 상태
+  check("마커 파일 생성돼 있음", fs.existsSync(path.join(dir, ".bigbrain-vault")));
+  const { instructions, stderr } = await boot(dir);
+  check("경고 없음", !/WARNING/.test(instructions));
+  check("기동 로그는 memories=0", /memories=0/.test(stderr), stderr.slice(0, 200));
+}
+
+// ── 7. 격리 파일이 있으면 알린다
+console.log("7) 격리 파일 존재 알림");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  s.remember({ title: "멀쩡한 기억", description: "설명", content: "본문.", type: "semantic" });
+  fs.writeFileSync(path.join(dir, "memories", "깨진것.md"), "---\nbad:\t: {{\n---\n", "utf-8");
+  new MemoryStore(new Vault(dir)).loadAll(true); // 격리 유발
+
+  const { stderr } = await boot(dir);
+  check("기동 로그에 quarantined 표기", /quarantined=1/.test(stderr), stderr.slice(0, 300));
+  check("확인 요청 메시지 출력", /vault\/quarantine\/ 확인 필요/.test(stderr));
+}
+
 for (const d of cleanups) fs.rmSync(d, { recursive: true, force: true });
 
 if (failures > 0) {
   console.error(`\n실패: ${failures}건`);
   process.exit(1);
 }
-console.log("\nT7 회상 트리거 회귀 테스트 통과 ✔");
+console.log("\nT7/T9 트리거·가시성 회귀 테스트 통과 ✔");

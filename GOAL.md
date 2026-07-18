@@ -93,7 +93,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
   - 어떻게: types.ts `project?: string` → vault.ts 직렬화/파싱(기본값 undefined = 전역) → store.search/list 에 `opts.project` 필터 `!m.project || m.project === opts.project` → index.ts remember/recall/list 스키마에 project 추가 → env `BIGBRAIN_PROJECT` 로 서버 기본값.
   - 검증: 프로젝트 A/B 기억 + 전역 기억 → A 필터 시 B 배제·전역 통과. 구버전 노트(project 없음) 파싱 무손상.
 
-- [ ] **T9. 실패의 가시화** (E3)
+- [x] **T9. 실패의 가시화** (E3) — 완료 2026-07-18
   - 무엇: 잘못된 BIGBRAIN_VAULT 는 조용히 빈 볼트를 새로 만들고(경고 0), 기동 로그는 기억 수를 안 찍는다 — "기억 전무"가 정상처럼 보이고 볼트가 분열된다.
   - 왜: high — 드라이브 이동/오타 하나로 무소음 전체 소실. 네이티브(순수 파일)에는 없는 실패 모드.
   - 어떻게: ① 기동 로그에 `memories=<수>` 출력 ② writeIndex 시 `.bigbrain-vault` 마커 생성 ③ BIGBRAIN_VAULT 명시됐는데 마커도 기억도 없으면 stderr 경고 + instructions 첫 줄에 동일 경고 부착 (모델에게도 보이게).
@@ -163,6 +163,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
 |---|---|---|
 | 2026-07-18 | 감사 완료 (47건 확정) + 본 계획 수립 | docs/native-parity-audit.md |
 | 2026-07-18 | 네이티브 5건 이관 + 브리지 전환 (SimpleMailServer) | 대체 전략 ④ 실증 |
+| 2026-07-18 | **T9** 실패의 가시화 | 기동 로그에 `memories=N archived=N quarantined=N(!) project=X`, `.bigbrain-vault` 마커(`writeIndex` 시 생성), `vault.inspect()` 진단. BIGBRAIN_VAULT 가 지정됐는데 기억 0 + 마커 없음이면 stderr **와 instructions 첫머리** 양쪽에 경고("중복 저장 금지"). 격리 파일 존재 시 별도 알림. **버그 하나 잡음**: `regenerateIndex`→`writeIndex`→`markVault` 가 main 의 경고 판정보다 먼저 실행돼 stderr 경고가 사라졌다 — 기동 시점에 한 번만 계산(`VAULT_WARNING` 상수)해 두 채널을 일치시킴. 회귀 4~7절 추가(오타 경로/정상 볼트 오경보/마커 있는 빈 볼트/격리 알림) — 전체 168✔/0✘ |
 | 2026-07-18 | **T8** 프로젝트 스코핑 | `project?: string` 필드 + `inScope()` 필터(`!m.project \|\| m.project === scope`) 를 search·연상확산·list 에 적용, remember/recall/list/revise 스키마에 노출, `BIGBRAIN_PROJECT` 서버 기본값. **계획 대비 판단**: remember 에서 `project` 생략 시 서버 스코프를 **몰래 씌우지 않음** — 씌우면 "전역이면 생략" 이라는 도구 설명과 모순되고 사용자 선호 같은 범용 지식이 한 프로젝트에 갇혀 조용히 회상되지 않는다. 대신 instructions 에 현재 스코프와 저장 지침을 실어 모델이 명시적으로 판단하게 함. 회귀 `scripts/regress-scoping.mjs` 신설(24건, 구버전 노트 하위 호환·연상 누수 차단·MCP 계층 포함) — 전체 155✔/0✘ |
 | 2026-07-18 | **T7** 회상 트리거 삼중화 | ① `memoryIndexLines()` 가 기동 시 기억 인덱스(제목+설명+타입)를 instructions 에 부착, `BIGBRAIN_INDEX_LIMIT`(기본 40) 상한·총건수 안내·빈 볼트 명시. ② **사용자 승인 후** `~/.claude/settings.json` 에 SessionStart 훅 추가 — `vault/MEMORY.md` 를 `<bigbrainmemory-index>` 태그로 감싸 주입(`head -c 8000` 상한). 기존 Orca 훅 10종 무변경, 백업 `settings.json.bak-bbm-20260718`. 실제 실행해 3,224자 출력 확인. ③ README 에 3중 채널 문서화 + 죽은 `D:/` 경로 정리. 회귀 `scripts/regress-trigger.mjs` 신설(12건, `client.getInstructions()` 로 실제 스폰 검증) — 전체 131✔/0✘ |
 | 2026-07-18 | **P0 완료** — 데이터 안전 6/6 | T1~T6 전부 통과. 회귀 테스트 4종 118✔/0✘ 로 감사 재현 시나리오 고정 |

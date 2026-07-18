@@ -292,6 +292,41 @@ export class Vault {
 
   writeIndex(markdown: string): void {
     writeFileAtomic(path.join(this.root, "MEMORY.md"), markdown);
+    this.markVault();
+  }
+
+  /**
+   * 이 디렉터리가 BigBrainMemory 볼트임을 표시한다 (감사 E3).
+   * 경로 오타로 엉뚱한 곳을 가리켜도 mkdirSync 가 조용히 빈 볼트를 만들어버려
+   * "기억 전무" 가 정상처럼 보였다. 마커가 있으면 "진짜 빈 볼트" 와
+   * "잘못된 경로에 새로 생긴 볼트" 를 구분할 수 있다.
+   */
+  private markVault(): void {
+    const marker = path.join(this.root, ".bigbrain-vault");
+    try {
+      if (!fs.existsSync(marker)) {
+        fs.writeFileSync(marker, `BigBrainMemory vault\ncreated: ${new Date().toISOString()}\n`, "utf-8");
+      }
+    } catch {
+      /* 마커는 진단용 편의 기능 — 실패해도 무시 */
+    }
+  }
+
+  /** 볼트 상태 진단 — 기동 로그와 경고에 쓴다 (E3) */
+  inspect(): { memories: number; archived: number; quarantined: number; hasMarker: boolean } {
+    const count = (dir: string) => {
+      try {
+        return fs.readdirSync(dir).filter((f) => f.endsWith(".md")).length;
+      } catch {
+        return 0;
+      }
+    };
+    return {
+      memories: count(this.memoriesDir),
+      archived: count(this.archiveDir),
+      quarantined: count(this.quarantineDir),
+      hasMarker: fs.existsSync(path.join(this.root, ".bigbrain-vault")),
+    };
   }
 
   /** 제목에서 Windows/Obsidian 호환 파일명 slug 생성 (한글 등 유니코드 유지) */
