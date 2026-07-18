@@ -151,7 +151,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
 ## Phase P3 — 선택
 
 - [x] **T19. consolidate 프롬프트** (E6) — 완료 2026-07-19: `server.registerPrompt('consolidate', ...)` — reflect→비교→병합→forget→link→재확인 절차. Claude Code 에서 `/mcp__bigbrainmemory__consolidate` 로 노출.
-- [ ] **T20. import-native.mjs** (E5): 매핑 고정(user→preference, feedback→procedural|preference, project→semantic|episodic, reference→semantic+source), `project:` 태그 부여(T8 연동), 동일 source 스킵(멱등).
+- [x] **T20. import-native.mjs** (E5) — 완료 2026-07-19: 매핑 고정(user→preference, feedback→procedural|preference, project→semantic|episodic, reference→semantic+source), `project:` 태그 부여(T8 연동), 동일 source 스킵(멱등).
 - [ ] **T21. 성능·이식성** (F1~F4): 기동 시 id→slug 인덱스(1000건 볼트 resolve 418ms→상수시간), history 최근 50개 캡, today() 로컬 날짜, makeSlug 예약명 회피(`con_`).
 - [ ] **T22. 로컬 임베딩 하이브리드** (D1 장기): keyword 0건 시 벡터 유사도 폴백.
 
@@ -163,6 +163,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
 |---|---|---|
 | 2026-07-18 | 감사 완료 (47건 확정) + 본 계획 수립 | docs/native-parity-audit.md |
 | 2026-07-18 | 네이티브 5건 이관 + 브리지 전환 (SimpleMailServer) | 대체 전략 ④ 실증 |
+| 2026-07-19 | **T20** import-native.mjs | 매핑 고정(user→preference, feedback→procedural\|preference 본문 판단, project→semantic\|episodic 본문 판단, reference→procedural) + 판단 근거 출력. `project` 스코프에 프로젝트 슬러그 부여(T8 연동), `source: native:<프로젝트>/<파일>` 로 **멱등**(재실행 시 건너뜀). **계획 대비 강화**: `--apply` 없이는 쓰지 않는 미리보기가 기본값(안전 기본값), `--projects-dir`/`--vault` 주입으로 테스트 가능. 제목을 원본 `name` 그대로 써 본문 `[[위키링크]]` 보존. 회귀 `scripts/regress-import.mjs` 신설(32건, 라이브 볼트·네이티브 양쪽 무접촉). 실환경 미리보기 실행 결과 대상 0건(브리지 MEMORY.md 는 제외 대상) — 전체 337✔/0✘ |
 | 2026-07-19 | **T19** consolidate 프롬프트 | `server.registerPrompt('consolidate')` — Claude Code 에서 `/mcp__bigbrainmemory__consolidate` 로 노출. reflect 의 **모든 출력 항목**(duplicates/forget_candidates/trusted_but_faded/low_confidence/orphans)에 대한 처리 지침 + 파괴적 조치 안전장치(애매하면 forget 대신 revise) + staleness 대조 지침 + 재확인 단계. 회귀 `scripts/regress-prompt.mjs` 신설(26건, 실제 스폰 후 listPrompts/getPrompt 검증) — 전체 305✔/0✘ |
 | 2026-07-18 | **P2 완료** — 랭킹·검색 품질 7/7 | T12~T18. 회귀 테스트 10종 279✔/0✘ |
 | 2026-07-18 | **T18** 강화 정밀화 | RIF 로 억제된 경쟁자와 연상 이웃을 강화에서 제외(C5) — 종전에는 순위를 눌러놓고 같은 델타를 줘서 중복 쌍이 영원히 동률로 갔다. revise 가 간격 게이트를 준수하도록 변경(C6, 종전 몇 초 안 2회면 1→3) + 순수 메타데이터 편집(태그만 변경)은 강화 제외. reflect 에 `trustedButFaded` 노출 — 약해졌지만 확신도가 높아 망각 후보에서 제외된 건수(P6 보수 설계는 유지하되 정리 판단 재료 제공). 회귀 6~9절 추가 — 전체 279✔/0✘ |
