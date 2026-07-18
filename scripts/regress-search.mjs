@@ -5,6 +5,8 @@
 //      에이전트는 "기억이 없다" 고 결론 내리고 같은 사실을 재학습·중복 저장한다.
 //   D2 직접 매칭이 0건이면 연상(1-hop) 확산도 시드가 없어 진입 자체가 불가능했다.
 //      link() 에 투자한 연상 네트워크가 정작 표층 어휘가 어긋난 질의에서 무력했다.
+//   T23 조사가 붙은 질의 토큰이 동의어 사전 조회에서 누락돼, "배포 방법" 은 찾는
+//      기억을 "배포를 하려면" 은 0건으로 놓쳤다 (한국어에선 조사가 붙는 쪽이 자연스럽다).
 //
 // 라이브 볼트는 건드리지 않는다 — 전부 os.tmpdir() 임시 볼트.
 
@@ -287,10 +289,36 @@ console.log("16) 스니펫 다중 토큰 커버리지 (D7)");
   check("질의 어순에 따라 결과가 달라지지 않음", a === b, `A=${a}\n       B=${b}`);
 }
 
+// ── 17. 조사가 붙은 질의도 동의어 사전을 탄다 (T23)
+console.log("17) 조사 부착 토큰의 동의어 확장 (T23)");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  // 한국어 표기가 **어디에도 없는** 기억 — 오직 동의어 확장으로만 도달할 수 있다.
+  s.remember({ title: "deploy 순서", description: "production 반영 절차", content: "build 후 release 한다.", type: "procedural" });
+  s.remember({ title: "무관한 고양이 메모", description: "반려동물", content: "찰리는 삼색이다.", type: "episodic" });
+
+  const hit = (q) => slugs(new MemoryStore(new Vault(dir)).search(q, { includeLinked: false })).includes("deploy-순서");
+  check("조사 없는 질의 (종전에도 동작)", hit("배포 방법"));
+  check("목적격 조사 '를' (종전 0건)", hit("배포를 하려면"));
+  check("주격 조사 '가' (종전 0건)", hit("배포가 실패"));
+  check("부사격 조사 '로' (종전 0건)", hit("배포로 넘어가기"));
+  check("어간이 사전에 없으면 여전히 안 잡힘", !hit("고양이를 배웅"), "무관 질의가 새어 들어옴");
+
+  // 어간 자체는 토큰에 넣지 않는다 — 넣으면 원형(만점)과 어간(동의어 가중)이
+  // 같은 기억에 이중 가산돼 점수가 부푼다.
+  const dir2 = freshDir();
+  const t = new MemoryStore(new Vault(dir2));
+  t.remember({ title: "배포 절차", description: "배포 순서", content: "배포 본문.", type: "procedural" });
+  const bare = new MemoryStore(new Vault(dir2)).search("배포", { includeLinked: false })[0].score;
+  const withP = new MemoryStore(new Vault(dir2)).search("배포를", { includeLinked: false })[0].score;
+  check("조사 부착이 점수를 부풀리지 않음", withP <= bare * 1.001, `bare=${bare} withParticle=${withP}`);
+}
+
 for (const d of cleanups) fs.rmSync(d, { recursive: true, force: true });
 
 if (failures > 0) {
   console.error(`\n실패: ${failures}건`);
   process.exit(1);
 }
-console.log("\nT15/T16/T17 검색 회귀 테스트 통과 ✔");
+console.log("\nT15/T16/T17/T23 검색 회귀 테스트 통과 ✔");

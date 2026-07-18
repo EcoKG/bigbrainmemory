@@ -180,10 +180,40 @@ const SYNONYM_INDEX: Map<string, string[]> = (() => {
   return idx;
 })();
 
-/** 질의 토큰을 동의어까지 확장한다 (원 토큰은 항상 포함) */
+/** 한국어 조사 — 긴 것부터 (부분 스트립 방지) */
+const PARTICLES = [
+  "으로서", "으로써", "에게서", "이라도", "으로", "에서", "부터", "까지", "에게", "한테",
+  "보다", "처럼", "이나", "라도", "조차", "마저", "밖에", "라는", "이란",
+  "을", "를", "이", "가", "은", "는", "에", "의", "로", "와", "과", "도", "만", "나",
+];
+
+/** 조사를 떼어낸 어간. 남는 길이가 2 미만이면 원형을 유지한다 */
+function stripParticle(t: string): string {
+  for (const p of PARTICLES) {
+    if (t.length - p.length >= 2 && t.endsWith(p)) return t.slice(0, -p.length);
+  }
+  return t;
+}
+
+/**
+ * 질의 토큰을 동의어까지 확장한다 (원 토큰은 항상 포함).
+ *
+ * 조사가 붙은 토큰은 **어간으로도 한 번 더 조회한다**. 종전에는 원형만 사전에
+ * 넣어봐서 "배포 방법" 은 `deploy` 로만 적힌 기억을 찾아내지만 "배포를 하려면" 은
+ * 0건이었다 — 조사 흡수는 tokenMatch 가 하지만 그건 이미 만들어진 토큰끼리의
+ * 비교일 뿐이고, 사전 조회 단계에서 어간을 보지 않으면 동의어가 생성 자체를
+ * 안 한다. 한국어 질의는 조사가 붙는 쪽이 오히려 자연스러우므로 손실이 컸다.
+ */
 function expandTokens(tokens: string[]): string[] {
   const out = new Set(tokens);
-  for (const t of tokens) for (const syn of SYNONYM_INDEX.get(t) ?? []) out.add(syn);
+  for (const t of tokens) {
+    for (const syn of SYNONYM_INDEX.get(t) ?? []) out.add(syn);
+    const stem = stripParticle(t);
+    if (stem === t) continue;
+    // 어간 자체는 넣지 않는다 — tokenMatch 가 이미 조사를 흡수하므로 회수 이득이
+    // 없고, 원형과 어간이 같은 기억에 이중 가산돼 점수만 부푼다.
+    for (const syn of SYNONYM_INDEX.get(stem) ?? []) if (syn !== stem) out.add(syn);
+  }
   return [...out];
 }
 
@@ -199,21 +229,6 @@ function stripLinkSection(body: string): string {
     .replace(/\n#{1,6}\s*연관 기억[\s\S]*$/u, "")
     .replace(/\[\[[^\]]+\]\]/gu, "")
     .trim();
-}
-
-/** 한국어 조사 — 긴 것부터 (부분 스트립 방지) */
-const PARTICLES = [
-  "으로서", "으로써", "에게서", "이라도", "으로", "에서", "부터", "까지", "에게", "한테",
-  "보다", "처럼", "이나", "라도", "조차", "마저", "밖에", "라는", "이란",
-  "을", "를", "이", "가", "은", "는", "에", "의", "로", "와", "과", "도", "만", "나",
-];
-
-/** 조사를 떼어낸 어간. 남는 길이가 2 미만이면 원형을 유지한다 */
-function stripParticle(t: string): string {
-  for (const p of PARTICLES) {
-    if (t.length - p.length >= 2 && t.endsWith(p)) return t.slice(0, -p.length);
-  }
-  return t;
 }
 
 /**
