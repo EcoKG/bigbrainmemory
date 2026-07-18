@@ -54,8 +54,6 @@ const DUPLICATE_THRESHOLD = 0.6; // reflect 의 중복 후보 (종전 0.75)
 const MIN_OVERLAP_TOKENS = 3;
 /** 동의어로만 맞은 토큰의 가중 — 정확히 일치한 기억이 여전히 위로 오게 한다 (감사 D1) */
 const SYNONYM_WEIGHT = 0.6;
-/** 직접 매칭 0건일 때 쓰는 2차(느슨한 접두) 패스의 토큰당 점수 (감사 D2) */
-const FALLBACK_KEYWORD_WEIGHT = 1.5;
 /**
  * 확장 간격 계수 (P3, 감사 C3). 필요 간격이 `α · 나이 / n` 으로 늘어난다.
  * 0 이면 종전의 고정 창 동작. 기본 0.1 = 나이의 10% 를 n 으로 나눈 만큼.
@@ -558,18 +556,14 @@ export class MemoryStore {
       scored.push(finish(m, keyword));
     }
 
-    // 2차 패스 — 직접 매칭이 0건이면 제목·태그를 토큰화해 **느슨한 접두 비교**로
-    // 시드를 만든다(감사 D2). 종전에는 0건이면 연상(1-hop) 확산도 시드가 없어
-    // 진입 자체가 불가능했다 — link() 에 투자한 연상 네트워크가 정작 표층 어휘가
-    // 어긋난 질의에서 아무 도움이 못 됐다.
-    if (scored.length === 0) {
-      for (const m of candidates) {
-        const fieldTokens = tokenize(`${m.title} ${m.tags.join(" ")} ${m.description}`);
-        const hits = expanded.filter((t) => fieldTokens.some((u) => tokenMatch(t, u))).length;
-        if (hits === 0) continue;
-        scored.push(finish(m, hits * FALLBACK_KEYWORD_WEIGHT));
-      }
-    }
+    // 여기에 "0건이면 제목·태그를 느슨하게 재검사" 하는 2차 패스가 있었다(감사 D2).
+    // T16 이 1차 패스의 매처를 includes 에서 tokenMatch 로 통일하면서 무력화됐다 —
+    // 1차가 title·tag·desc·**body** 를 이미 tokenMatch 로 보므로 0건이라는 것은 곧
+    // 네 필드 전부 불일치이고, 2차는 그 **부분집합**(title·tag·desc)을 **같은 매처**로
+    // 다시 볼 뿐이라 결과가 나올 수 없다. 실측: 질의 3040건 중 3025건이 이 블록에
+    // 진입했으나 생산은 0건이었고, 대신 진입할 때마다 후보 전체를 재토큰화하는
+    // 비용만 치렀다. 되살리려면 필드를 넓히는 게 아니라 **더 느슨한 매처**가 필요하다
+    // (n-gram·임베딩). T22 평가에서 둘 다 근거 부족으로 기각됐다 — GOAL.md 참조.
 
     scored.sort((a, b) => b.score - a.score);
 
