@@ -3,6 +3,9 @@ import path from "node:path";
 import matter from "gray-matter";
 import type { MemoryRecord, MemoryStatus, MemoryType } from "./types.js";
 
+/** Windows 예약 장치명 (대소문자 무관) — 파일명 어간으로 쓰면 안 된다 */
+const RESERVED_BASENAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+
 const VALID_TYPES: MemoryType[] = ["episodic", "semantic", "procedural", "preference"];
 const VALID_STATUS: MemoryStatus[] = ["active", "superseded", "archived"];
 
@@ -351,7 +354,13 @@ export class Vault {
       .replace(/\s+/g, "-")
       .toLowerCase()
       .slice(0, 80);
+    // 끝의 마침표·공백 제거 — 확장자가 붙어 실해는 없지만 외부 도구가 정규화할 수 있다
+    base = base.replace(/[. ]+$/, "");
     if (!base) base = "memory";
+    // Windows 예약 장치명 회피 (감사 F3). 현재 Win11+Node22 에서는 con.md 도 정상
+    // 생성되지만, 구형 Windows·네트워크 드라이브·백업 도구는 이를 장치로 취급해
+    // slug 와 실제 파일명이 어긋날 수 있다. 방어 비용이 0 에 가까우므로 선제 회피한다.
+    if (RESERVED_BASENAMES.test(base)) base = `${base}_`;
     let slug = base;
     let n = 2;
     while (this.exists(slug)) {

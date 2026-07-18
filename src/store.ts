@@ -54,8 +54,6 @@ const DUPLICATE_THRESHOLD = 0.6; // reflect 의 중복 후보 (종전 0.75)
 const MIN_OVERLAP_TOKENS = 3;
 /** 동의어로만 맞은 토큰의 가중 — 정확히 일치한 기억이 여전히 위로 오게 한다 (감사 D1) */
 const SYNONYM_WEIGHT = 0.6;
-/** 직접 매칭 0건일 때 쓰는 2차(느슨한 접두) 패스의 토큰당 점수 (감사 D2) */
-const FALLBACK_KEYWORD_WEIGHT = 1.5;
 /**
  * 확장 간격 계수 (P3, 감사 C3). 필요 간격이 `α · 나이 / n` 으로 늘어난다.
  * 0 이면 종전의 고정 창 동작. 기본 0.1 = 나이의 10% 를 n 으로 나눈 만큼.
@@ -80,8 +78,35 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+/**
+ * 사람이 읽는 이력용 **로컬** 날짜 (감사 F2).
+ * 종전에는 UTC ISO 를 잘라 써서 KST 사용자는 자정~오전 9시에 history 날짜가
+ * 하루 어긋났다("어제/오늘" 회고와 시간 정렬 인지에 혼선).
+ * 저장되는 타임스탬프(created/updated 등)는 UTC ISO 그대로 유지한다 —
+ * 활성·감쇠 계산은 그 값을 쓰므로 건드리면 안 된다.
+ */
 function today(): string {
-  return nowIso().slice(0, 10);
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** 이력 최대 보관 줄 수 — 초과분은 가장 오래된 것부터 접는다 (감사 F4) */
+const HISTORY_CAP = 50;
+
+/**
+ * 이력 한 줄 추가 + 상한 유지.
+ * 종전에는 상한이 없어 revise/forget/supersede 마다 약 65B 씩 무한 누적됐고
+ * (재확인 110회 → 935B에서 7,426B), frontmatter 전체가 매 read 마다 재파싱된다.
+ * 오래된 줄은 버리되 **몇 줄을 접었는지는 남겨** 이력이 잘렸다는 사실이 보이게 한다.
+ */
+function pushHistory(m: MemoryRecord, line: string): void {
+  m.history.push(line);
+  if (m.history.length <= HISTORY_CAP) return;
+  const dropped = m.history.length - HISTORY_CAP;
+  const prevFolded = /^\.\.\. 이전 이력 (\d+)줄 생략$/.exec(m.history[0] ?? "");
+  const total = (prevFolded ? Number(prevFolded[1]) : 0) + dropped;
+  m.history = [`... 이전 이력 ${total}줄 생략`, ...m.history.slice(dropped + (prevFolded ? 1 : 0))];
 }
 
 function newId(): string {
@@ -153,10 +178,40 @@ const SYNONYM_INDEX: Map<string, string[]> = (() => {
   return idx;
 })();
 
-/** 질의 토큰을 동의어까지 확장한다 (원 토큰은 항상 포함) */
+/** 한국어 조사 — 긴 것부터 (부분 스트립 방지) */
+const PARTICLES = [
+  "으로서", "으로써", "에게서", "이라도", "으로", "에서", "부터", "까지", "에게", "한테",
+  "보다", "처럼", "이나", "라도", "조차", "마저", "밖에", "라는", "이란",
+  "을", "를", "이", "가", "은", "는", "에", "의", "로", "와", "과", "도", "만", "나",
+];
+
+/** 조사를 떼어낸 어간. 남는 길이가 2 미만이면 원형을 유지한다 */
+function stripParticle(t: string): string {
+  for (const p of PARTICLES) {
+    if (t.length - p.length >= 2 && t.endsWith(p)) return t.slice(0, -p.length);
+  }
+  return t;
+}
+
+/**
+ * 질의 토큰을 동의어까지 확장한다 (원 토큰은 항상 포함).
+ *
+ * 조사가 붙은 토큰은 **어간으로도 한 번 더 조회한다**. 종전에는 원형만 사전에
+ * 넣어봐서 "배포 방법" 은 `deploy` 로만 적힌 기억을 찾아내지만 "배포를 하려면" 은
+ * 0건이었다 — 조사 흡수는 tokenMatch 가 하지만 그건 이미 만들어진 토큰끼리의
+ * 비교일 뿐이고, 사전 조회 단계에서 어간을 보지 않으면 동의어가 생성 자체를
+ * 안 한다. 한국어 질의는 조사가 붙는 쪽이 오히려 자연스러우므로 손실이 컸다.
+ */
 function expandTokens(tokens: string[]): string[] {
   const out = new Set(tokens);
-  for (const t of tokens) for (const syn of SYNONYM_INDEX.get(t) ?? []) out.add(syn);
+  for (const t of tokens) {
+    for (const syn of SYNONYM_INDEX.get(t) ?? []) out.add(syn);
+    const stem = stripParticle(t);
+    if (stem === t) continue;
+    // 어간 자체는 넣지 않는다 — tokenMatch 가 이미 조사를 흡수하므로 회수 이득이
+    // 없고, 원형과 어간이 같은 기억에 이중 가산돼 점수만 부푼다.
+    for (const syn of SYNONYM_INDEX.get(stem) ?? []) if (syn !== stem) out.add(syn);
+  }
   return [...out];
 }
 
@@ -172,21 +227,6 @@ function stripLinkSection(body: string): string {
     .replace(/\n#{1,6}\s*연관 기억[\s\S]*$/u, "")
     .replace(/\[\[[^\]]+\]\]/gu, "")
     .trim();
-}
-
-/** 한국어 조사 — 긴 것부터 (부분 스트립 방지) */
-const PARTICLES = [
-  "으로서", "으로써", "에게서", "이라도", "으로", "에서", "부터", "까지", "에게", "한테",
-  "보다", "처럼", "이나", "라도", "조차", "마저", "밖에", "라는", "이란",
-  "을", "를", "이", "가", "은", "는", "에", "의", "로", "와", "과", "도", "만", "나",
-];
-
-/** 조사를 떼어낸 어간. 남는 길이가 2 미만이면 원형을 유지한다 */
-function stripParticle(t: string): string {
-  for (const p of PARTICLES) {
-    if (t.length - p.length >= 2 && t.endsWith(p)) return t.slice(0, -p.length);
-  }
-  return t;
 }
 
 /**
@@ -321,15 +361,56 @@ export class MemoryStore {
     return out;
   }
 
-  /** id 또는 slug로 조회 */
+  /**
+   * id → slug 캐시 (감사 F1).
+   *
+   * slug 로 못 찾으면 id 를 찾으려고 볼트 전체를 읽어 파싱했다.
+   * 1000건 볼트에서 resolve(id) 418ms, **존재하지 않는 id 는 항상 풀스캔** 384ms.
+   * revise/forget/link/read_memory 가 id 를 받을 때마다 이 비용을 치렀다.
+   * 한 번 스캔한 결과를 기억해 두고, 미스일 때만 다시 훑는다.
+   */
+  private idIndex: Map<string, string> | null = null;
+  /** 인덱스를 만든 시점의 노트 파일 수 — 볼트가 변했는지 싸게 판정한다 */
+  private idIndexSize = -1;
+
+  private buildIdIndex(): Map<string, string> {
+    const slugs = this.vault.listSlugs(true);
+    const idx = new Map<string, string>();
+    for (const { slug, archived } of slugs) {
+      const rec = this.vault.read(slug, archived);
+      if (rec) idx.set(rec.id, slug);
+    }
+    this.idIndex = idx;
+    this.idIndexSize = slugs.length;
+    return idx;
+  }
+
+  /**
+   * id 또는 slug 로 조회.
+   *
+   * 없는 id 도 정확히 없다고 답해야 하므로, 캐시 미스가 "정말 없음" 인지
+   * "다른 프로세스가 그 사이 추가함" 인지 구분해야 한다. 전량 재파싱 대신
+   * **파일 수만 세어**(readdir 2회) 볼트 변화를 감지한다 — 수가 그대로면 캐시를 믿고,
+   * 달라졌으면 다시 만든다. 파일 수가 같은 이동(forget: memories→archive)은
+   * vault.find 가 양쪽을 모두 보므로 문제되지 않는다.
+   */
   resolve(idOrSlug: string): { record: MemoryRecord; archived: boolean } | null {
     const bySlug = this.vault.find(idOrSlug);
     if (bySlug) return bySlug;
-    for (const { slug, archived } of this.vault.listSlugs(true)) {
-      const rec = this.vault.read(slug, archived);
-      if (rec && rec.id === idOrSlug) return { record: rec, archived };
+
+    const verify = (slug: string | undefined) => {
+      if (!slug) return null;
+      const found = this.vault.find(slug);
+      return found && found.record.id === idOrSlug ? found : null;
+    };
+
+    if (this.idIndex) {
+      const hit = verify(this.idIndex.get(idOrSlug));
+      if (hit) return hit;
+      // 미스 — 볼트가 그대로면 정말 없는 것이다 (풀스캔 생략)
+      if (this.vault.listSlugs(true).length === this.idIndexSize) return null;
     }
-    return null;
+    return verify(this.buildIdIndex().get(idOrSlug));
   }
 
   remember(input: RememberInput): { record: MemoryRecord; similar: MemoryRecord[] } {
@@ -368,7 +449,7 @@ export class MemoryStore {
     const superseded = found && !found.archived ? found.record : null;
     if (superseded) {
       record.supersedes = superseded.slug;
-      record.history.push(`${today()}: supersedes [[${superseded.slug}]]`);
+      pushHistory(record, `${today()}: supersedes [[${superseded.slug}]]`);
     }
 
     // 원자적 생성 — slug 확정과 파일 생성이 한 연산이라 동시 remember 가 서로를
@@ -381,7 +462,7 @@ export class MemoryStore {
       superseded.status = "superseded";
       superseded.supersededBy = finalSlug;
       superseded.updated = now;
-      superseded.history.push(`${today()}: superseded by [[${finalSlug}]]`);
+      pushHistory(superseded, `${today()}: superseded by [[${finalSlug}]]`);
       this.vault.write(superseded);
     }
 
@@ -475,18 +556,14 @@ export class MemoryStore {
       scored.push(finish(m, keyword));
     }
 
-    // 2차 패스 — 직접 매칭이 0건이면 제목·태그를 토큰화해 **느슨한 접두 비교**로
-    // 시드를 만든다(감사 D2). 종전에는 0건이면 연상(1-hop) 확산도 시드가 없어
-    // 진입 자체가 불가능했다 — link() 에 투자한 연상 네트워크가 정작 표층 어휘가
-    // 어긋난 질의에서 아무 도움이 못 됐다.
-    if (scored.length === 0) {
-      for (const m of candidates) {
-        const fieldTokens = tokenize(`${m.title} ${m.tags.join(" ")} ${m.description}`);
-        const hits = expanded.filter((t) => fieldTokens.some((u) => tokenMatch(t, u))).length;
-        if (hits === 0) continue;
-        scored.push(finish(m, hits * FALLBACK_KEYWORD_WEIGHT));
-      }
-    }
+    // 여기에 "0건이면 제목·태그를 느슨하게 재검사" 하는 2차 패스가 있었다(감사 D2).
+    // T16 이 1차 패스의 매처를 includes 에서 tokenMatch 로 통일하면서 무력화됐다 —
+    // 1차가 title·tag·desc·**body** 를 이미 tokenMatch 로 보므로 0건이라는 것은 곧
+    // 네 필드 전부 불일치이고, 2차는 그 **부분집합**(title·tag·desc)을 **같은 매처**로
+    // 다시 볼 뿐이라 결과가 나올 수 없다. 실측: 질의 3040건 중 3025건이 이 블록에
+    // 진입했으나 생산은 0건이었고, 대신 진입할 때마다 후보 전체를 재토큰화하는
+    // 비용만 치렀다. 되살리려면 필드를 넓히는 게 아니라 **더 느슨한 매처**가 필요하다
+    // (n-gram·임베딩). T22 평가에서 둘 다 근거 부족으로 기각됐다 — GOAL.md 참조.
 
     scored.sort((a, b) => b.score - a.score);
 
@@ -596,7 +673,8 @@ export class MemoryStore {
     }
     m.lastAccessed = nowIso();
     m.updated = nowIso();
-    m.history.push(
+    pushHistory(
+      m,
       `${today()}: ${contentChanged ? "revised" : "reconfirmed"} — ${input.reason}${input.source ? ` (source: ${input.source})` : ""}`,
     );
     this.vault.write(m, found.archived);
@@ -612,7 +690,7 @@ export class MemoryStore {
     m.status = "archived";
     m.archiveReason = reason;
     m.updated = nowIso();
-    m.history.push(`${today()}: forgotten — ${reason}`);
+    pushHistory(m, `${today()}: forgotten — ${reason}`);
     if (!found.archived) {
       this.vault.write(m); // 이력 반영 후 이동
       this.vault.moveToArchive(m.slug);

@@ -1,10 +1,16 @@
-// T15 회귀 테스트 — 동의어 확장과 0건 폴백.
+// T15 회귀 테스트 — 동의어 확장과 표층 미스매치 회수.
 //
 // 고정하는 버그:
 //   D1 검색이 표층 부분문자열 매칭이라 "배포" 로 저장한 기억을 deploy 로 찾으면 0건.
 //      에이전트는 "기억이 없다" 고 결론 내리고 같은 사실을 재학습·중복 저장한다.
 //   D2 직접 매칭이 0건이면 연상(1-hop) 확산도 시드가 없어 진입 자체가 불가능했다.
 //      link() 에 투자한 연상 네트워크가 정작 표층 어휘가 어긋난 질의에서 무력했다.
+//   T23 조사가 붙은 질의 토큰이 동의어 사전 조회에서 누락돼, "배포 방법" 은 찾는
+//      기억을 "배포를 하려면" 은 0건으로 놓쳤다 (한국어에선 조사가 붙는 쪽이 자연스럽다).
+//
+// 주의 — 5~7번의 이름이 한때 "2차 패스" 를 주장했으나 사실이 아니었다. D2 를 메운 것은
+// 1차 패스의 복합어 접두 규칙이고, 2차 패스는 T16 이후 한 번도 결과를 낸 적이 없다
+// (질의 3040건 중 3025건 진입 / 생산 0건). T24 에서 제거했고 18번이 그 불변식을 잠근다.
 //
 // 라이브 볼트는 건드리지 않는다 — 전부 os.tmpdir() 임시 볼트.
 
@@ -93,8 +99,8 @@ console.log("4) 사용자 동의어 사전");
   }
 }
 
-// ── 5. 0건 폴백 — 연상 확산 진입 (감사 실측 실패 사례)
-console.log("5) 0건 시 2차 패스 + 연상 확산 (D2)");
+// ── 5. 표층 미스매치 회수 → 연상 확산 진입 (감사 실측 실패 사례)
+console.log("5) 표층 미스매치 질의의 회수 + 연상 확산 (D2)");
 {
   const dir = freshDir();
   const s = new MemoryStore(new Vault(dir));
@@ -103,19 +109,20 @@ console.log("5) 0건 시 2차 패스 + 연상 확산 (D2)");
   s.link("배포-절차", "릴리스-노트-작성법", "연관");
 
   const q = new MemoryStore(new Vault(dir));
-  // "릴리스노트" — 붙여 쓴 형태. 부분문자열로는 어디에도 안 걸리고(제목엔 공백이 있다),
-  // 동의어 사전에도 없다. 오직 2차 패스의 느슨한 접두 비교로만 시드가 만들어진다.
+  // "릴리스노트" — 붙여 쓴 형태. 제목엔 공백이 있어 통짜 부분문자열로는 안 걸리고
+  // 동의어 사전에도 없다. tokenMatch 의 복합어 접두 규칙(짧은 쪽 3자 이상 + 길이차
+  // 2 이하)이 "릴리스노트" ≈ "릴리스" 를 성립시켜 1차 패스가 시드를 만든다.
   const direct = q.search("릴리스노트");
   const got = slugs(direct);
   check("표층 미스매치 질의가 0건이 아님 (종전 0건)", got.length > 0, `got=${got.join(",")}`);
-  check("2차 패스가 제목 토큰으로 시드를 만듦", got.includes("릴리스-노트-작성법"), got.join(","));
+  check("복합어 접두 규칙이 제목 토큰으로 시드를 만듦", got.includes("릴리스-노트-작성법"), got.join(","));
   check("그 시드에서 연상이 링크된 기억까지 확산", got.includes("배포-절차"), got.join(","));
   // 대조군: 링크망·직접 검색 자체는 정상
   check("직접 키워드는 정상 동작(대조군)", new MemoryStore(new Vault(dir)).search("배포").length >= 1);
 }
 
-// ── 6. 2차 패스가 무관한 기억을 끌어오지 않는다 (오탐 방지)
-console.log("6) 폴백 오탐 방지");
+// ── 6. 느슨한 회수가 무관한 기억까지 끌어오지 않는다 (오탐 방지)
+console.log("6) 오탐 방지");
 {
   const dir = freshDir();
   const s = new MemoryStore(new Vault(dir));
@@ -124,8 +131,8 @@ console.log("6) 폴백 오탐 방지");
   check("완전히 무관한 질의는 0건 유지", r.length === 0, slugs(r).join(","));
 }
 
-// ── 7. 직접 매칭이 있으면 2차 패스는 돌지 않는다 (정밀도 보존)
-console.log("7) 직접 매칭 시 폴백 미작동");
+// ── 7. 직접 매칭이 정상 키워드 점수를 받는다 (정밀도 보존)
+console.log("7) 직접 매칭의 점수 수준");
 {
   const dir = freshDir();
   const s = new MemoryStore(new Vault(dir));
@@ -133,7 +140,7 @@ console.log("7) 직접 매칭 시 폴백 미작동");
   s.remember({ title: "델타 비슷한 것", description: "느슨 매칭 후보", content: "무관 본문.", type: "semantic" });
   const r = new MemoryStore(new Vault(dir)).search("델타");
   check("직접 매칭만 반환 (느슨 매칭 남발 없음)", r.length === 2, slugs(r).join(","));
-  check("점수가 폴백 수준(1.5×)이 아닌 정상 키워드 점수", r[0].score > 3, `score=${r[0]?.score}`);
+  check("정상 키워드 점수 (종전 폴백 1.5× 수준이 아님)", r[0].score > 3, `score=${r[0]?.score}`);
 }
 
 // ── 8. 토큰 경계 — 'cat' 이 concatenate 를 잡지 않는다 (D4)
@@ -287,10 +294,57 @@ console.log("16) 스니펫 다중 토큰 커버리지 (D7)");
   check("질의 어순에 따라 결과가 달라지지 않음", a === b, `A=${a}\n       B=${b}`);
 }
 
+// ── 17. 조사가 붙은 질의도 동의어 사전을 탄다 (T23)
+console.log("17) 조사 부착 토큰의 동의어 확장 (T23)");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  // 한국어 표기가 **어디에도 없는** 기억 — 오직 동의어 확장으로만 도달할 수 있다.
+  s.remember({ title: "deploy 순서", description: "production 반영 절차", content: "build 후 release 한다.", type: "procedural" });
+  s.remember({ title: "무관한 고양이 메모", description: "반려동물", content: "찰리는 삼색이다.", type: "episodic" });
+
+  const hit = (q) => slugs(new MemoryStore(new Vault(dir)).search(q, { includeLinked: false })).includes("deploy-순서");
+  check("조사 없는 질의 (종전에도 동작)", hit("배포 방법"));
+  check("목적격 조사 '를' (종전 0건)", hit("배포를 하려면"));
+  check("주격 조사 '가' (종전 0건)", hit("배포가 실패"));
+  check("부사격 조사 '로' (종전 0건)", hit("배포로 넘어가기"));
+  check("어간이 사전에 없으면 여전히 안 잡힘", !hit("고양이를 배웅"), "무관 질의가 새어 들어옴");
+
+  // 어간 자체는 토큰에 넣지 않는다 — 넣으면 원형(만점)과 어간(동의어 가중)이
+  // 같은 기억에 이중 가산돼 점수가 부푼다.
+  const dir2 = freshDir();
+  const t = new MemoryStore(new Vault(dir2));
+  t.remember({ title: "배포 절차", description: "배포 순서", content: "배포 본문.", type: "procedural" });
+  const bare = new MemoryStore(new Vault(dir2)).search("배포", { includeLinked: false })[0].score;
+  const withP = new MemoryStore(new Vault(dir2)).search("배포를", { includeLinked: false })[0].score;
+  check("조사 부착이 점수를 부풀리지 않음", withP <= bare * 1.001, `bare=${bare} withParticle=${withP}`);
+}
+
+// ── 18. 죽은 2차 패스 제거 — 1차가 0건이면 최종도 0건 (T24)
+console.log("18) 느슨한 2차 폴백이 존재하지 않는다 (T24)");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  const titles = ["배포 절차", "릴리스 노트 작성법", "윈도우 빌드 환경", "업로드 보안 강화", "메일 서버 설정"];
+  titles.forEach((t, i) => s.remember({ title: t, description: `${t} 설명`, content: `${t} 본문 ${i}.`, type: "semantic" }));
+
+  // 제목 토큰의 **앞 2글자**만 남긴 질의 — 종전 2차 패스가 노렸던 바로 그 형태다.
+  // 1차의 접두 규칙(짧은 쪽 3자 이상)이 막으므로 0건이어야 하고, 이제 2차도 없다.
+  const q = new MemoryStore(new Vault(dir));
+  for (const t of ["배포", "릴리", "윈도", "업로", "메일"].map((x) => `${x} 관련`)) {
+    const n = q.search(t, { includeLinked: false }).length;
+    if (t.startsWith("배포") || t.startsWith("메일")) continue; // 3자 미만이 아닌 완전 일치 케이스
+    check(`2글자 접두 질의 "${t}" 는 0건`, n === 0, `n=${n}`);
+  }
+  // 완전히 무관한 질의도 0건 — 폴백이 살아 있으면 여기서 뭔가 새어 나온다
+  check("무관 질의 0건", q.search("쿼크플럭스존재하지않는단어", { includeLinked: false }).length === 0);
+  check("대조군: 정상 질의는 잡힘", q.search("업로드", { includeLinked: false }).length >= 1);
+}
+
 for (const d of cleanups) fs.rmSync(d, { recursive: true, force: true });
 
 if (failures > 0) {
   console.error(`\n실패: ${failures}건`);
   process.exit(1);
 }
-console.log("\nT15/T16/T17 검색 회귀 테스트 통과 ✔");
+console.log("\nT15/T16/T17/T23/T24 검색 회귀 테스트 통과 ✔");
