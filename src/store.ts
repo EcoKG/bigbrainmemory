@@ -42,6 +42,10 @@ const HARD_RETRIEVAL_ACTIVATION = 0.5 - Math.log(1 / (1 - 0.5)); // ≈ -0.193
  * 접근수 통계를 정확히 원하면 BIGBRAIN_FLUSH_EVERY_ACCESS=1 로 켠다.
  */
 const FLUSH_EVERY_ACCESS = /^(1|true|yes)$/i.test(process.env.BIGBRAIN_FLUSH_EVERY_ACCESS ?? "");
+/** 동의어로만 맞은 토큰의 가중 — 정확히 일치한 기억이 여전히 위로 오게 한다 (감사 D1) */
+const SYNONYM_WEIGHT = 0.6;
+/** 직접 매칭 0건일 때 쓰는 2차(느슨한 접두) 패스의 토큰당 점수 (감사 D2) */
+const FALLBACK_KEYWORD_WEIGHT = 1.5;
 /**
  * 확장 간격 계수 (P3, 감사 C3). 필요 간격이 `α · 나이 / n` 으로 늘어난다.
  * 0 이면 종전의 고정 창 동작. 기본 0.1 = 나이의 10% 를 n 으로 나눈 만큼.
@@ -79,6 +83,71 @@ function tokenize(text: string): string[] {
     .toLowerCase()
     .split(/[^\p{L}\p{N}]+/u)
     .filter((t) => t.length >= 2);
+}
+
+/**
+ * 한↔영 도메인 용어 사전 (감사 D1).
+ *
+ * 검색이 표층 부분문자열 매칭이라 "배포" 로 저장한 기억을 `deploy` 로 찾으면 0건이었다.
+ * 0건이면 에이전트는 "기억이 없다" 고 결론 내리고 같은 사실을 재학습·중복 저장한다 —
+ * RECALL FIRST 수칙의 실효를 깎는 최전선 결함이었다. 임베딩 없이도 가장 흔한
+ * 한↔영 혼용만은 메우도록 질의 토큰을 확장한다.
+ *
+ * 양방향으로 전개되며, 사용자 사전은 BIGBRAIN_SYNONYMS 로 덧붙일 수 있다
+ * (형식: "배포=deploy,릴리스;설정=config" — 그룹은 `;`, 항목은 `,`, 좌변은 대표어).
+ */
+const BUILTIN_SYNONYMS: string[][] = [
+  ["배포", "deploy", "deployment", "디플로이", "release", "릴리스", "릴리즈", "출시"],
+  ["설정", "config", "configuration", "설정값", "환경설정"],
+  ["서버", "server"],
+  ["빌드", "build", "컴파일", "compile"],
+  ["테스트", "test", "testing", "검증"],
+  ["오류", "에러", "error", "실패", "failure", "fail"],
+  ["버그", "bug", "결함", "defect"],
+  ["인증", "auth", "authentication", "로그인", "login"],
+  ["권한", "authorization", "permission", "퍼미션"],
+  ["데이터베이스", "db", "database", "디비"],
+  ["메모리", "memory", "기억"],
+  ["경로", "path", "패스", "디렉터리", "directory", "폴더", "folder"],
+  ["파일", "file"],
+  ["보안", "security", "시큐리티"],
+  ["성능", "performance", "perf", "속도", "speed"],
+  ["캐시", "cache", "캐싱", "caching"],
+  ["로그", "log", "logging", "로깅"],
+  ["의존성", "dependency", "dependencies", "패키지", "package"],
+  ["마이그레이션", "migration", "migrate", "이관"],
+  ["스키마", "schema"],
+  ["포트", "port"],
+  ["인스톨러", "installer", "설치", "install", "setup"],
+  ["사용자", "user", "유저", "계정", "account"],
+  ["문서", "docs", "documentation", "문서화"],
+];
+
+/** 토큰 → 동의어 집합. 소문자 키. */
+const SYNONYM_INDEX: Map<string, string[]> = (() => {
+  const groups = BUILTIN_SYNONYMS.map((g) => [...g]);
+  // 사용자 사전 병합
+  for (const raw of (process.env.BIGBRAIN_SYNONYMS ?? "").split(";")) {
+    const [head, rest] = raw.split("=");
+    if (!head || !rest) continue;
+    const words = [head, ...rest.split(",")].map((w) => w.trim().toLowerCase()).filter(Boolean);
+    if (words.length >= 2) groups.push(words);
+  }
+  const idx = new Map<string, string[]>();
+  for (const g of groups) {
+    for (const w of g) {
+      const key = w.toLowerCase();
+      idx.set(key, [...new Set([...(idx.get(key) ?? []), ...g.map((x) => x.toLowerCase())])]);
+    }
+  }
+  return idx;
+})();
+
+/** 질의 토큰을 동의어까지 확장한다 (원 토큰은 항상 포함) */
+function expandTokens(tokens: string[]): string[] {
+  const out = new Set(tokens);
+  for (const t of tokens) for (const syn of SYNONYM_INDEX.get(t) ?? []) out.add(syn);
+  return [...out];
 }
 
 /** 한국어 조사/어미 변화를 흡수하기 위한 접두 일치 ("모드를" ≈ "모드") */
@@ -260,11 +329,6 @@ export class MemoryStore {
   }
 
   /**
-   * 회상 — 키워드 점수 × 진실성 가중 × 기저활성 가중 (P2).
-   * 회상은 능동 인출로 간주해 상위 기억을 강화하고(P4),
-   * 같은 클러스터의 경쟁 유사 기억은 순위에서만 완만히 억제한다(P5, RIF).
-   */
-  /**
    * 프로젝트 스코프 필터 (감사 E2).
    * `project` 가 없는 기억은 **전역**이라 어느 프로젝트에서도 통과한다.
    * opts.project 가 없으면 필터 자체를 적용하지 않는다(전체 조회).
@@ -274,6 +338,13 @@ export class MemoryStore {
     return !m.project || m.project === project;
   }
 
+  /**
+   * 회상 — 키워드 점수 × 진실성 가중 × 기저활성 가중 (P2).
+   * 회상은 능동 인출로 간주해 상위 기억을 강화하고(P4),
+   * 같은 클러스터의 경쟁 유사 기억은 순위에서만 완만히 억제한다(P5, RIF).
+   * 질의 토큰은 한↔영 동의어로 확장되고, 직접 매칭이 0건이면 느슨한 2차 패스로
+   * 연상 확산의 시드를 만든다(D1/D2).
+   */
   search(
     query: string,
     opts?: { type?: MemoryType; limit?: number; includeLinked?: boolean; project?: string },
@@ -284,34 +355,58 @@ export class MemoryStore {
     const all = this.loadAll(true);
     const now = Date.now();
 
-    const scored: SearchResult[] = [];
-    for (const m of all) {
-      if (opts?.type && m.type !== opts.type) continue;
-      if (!this.inScope(m, opts?.project)) continue;
-      let keyword = 0;
-      const title = m.title.toLowerCase();
-      const desc = m.description.toLowerCase();
-      const body = m.body.toLowerCase();
-      const tags = m.tags.map((t) => t.toLowerCase());
-      for (const t of tokens) {
-        if (title.includes(t)) keyword += 5;
-        if (tags.some((tag) => tag.includes(t))) keyword += 4;
-        if (desc.includes(t)) keyword += 3;
-        let idx = -1;
-        let hits = 0;
-        while (hits < 3 && (idx = body.indexOf(t, idx + 1)) !== -1) hits++;
-        keyword += hits;
-      }
-      if (keyword === 0) continue;
+    // 질의 토큰을 한↔영 동의어까지 확장한다(감사 D1). 원 토큰은 만점,
+    // 동의어는 가중을 낮춰 정확히 일치하는 기억이 여전히 위로 오게 한다.
+    const expanded = expandTokens(tokens);
+    const exact = new Set(tokens);
 
+    const candidates = all.filter(
+      (m) => !(opts?.type && m.type !== opts.type) && this.inScope(m, opts?.project),
+    );
+
+    const finish = (m: MemoryRecord, keyword: number): SearchResult => {
       const activation = activationOf(m, now);
       let score = keyword;
       score *= 0.5 + 0.5 * m.confidence; // P1: 진실성 가중 (인출과 독립)
       score *= 0.55 + 0.9 * retrievalStrength(activation); // P2: 기저활성(빈도·최근성) 가중
       if (m.status !== "active") score *= 0.2; // 망각/대체된 기억은 희미하게
+      return { record: m, score, activation, snippet: this.snippet(m, expanded) };
+    };
 
-      scored.push({ record: m, score, activation, snippet: this.snippet(m, tokens) });
+    const scored: SearchResult[] = [];
+    for (const m of candidates) {
+      let keyword = 0;
+      const title = m.title.toLowerCase();
+      const desc = m.description.toLowerCase();
+      const body = m.body.toLowerCase();
+      const tags = m.tags.map((t) => t.toLowerCase());
+      for (const t of expanded) {
+        const w = exact.has(t) ? 1 : SYNONYM_WEIGHT;
+        if (title.includes(t)) keyword += 5 * w;
+        if (tags.some((tag) => tag.includes(t))) keyword += 4 * w;
+        if (desc.includes(t)) keyword += 3 * w;
+        let idx = -1;
+        let hits = 0;
+        while (hits < 3 && (idx = body.indexOf(t, idx + 1)) !== -1) hits++;
+        keyword += hits * w;
+      }
+      if (keyword === 0) continue;
+      scored.push(finish(m, keyword));
     }
+
+    // 2차 패스 — 직접 매칭이 0건이면 제목·태그를 토큰화해 **느슨한 접두 비교**로
+    // 시드를 만든다(감사 D2). 종전에는 0건이면 연상(1-hop) 확산도 시드가 없어
+    // 진입 자체가 불가능했다 — link() 에 투자한 연상 네트워크가 정작 표층 어휘가
+    // 어긋난 질의에서 아무 도움이 못 됐다.
+    if (scored.length === 0) {
+      for (const m of candidates) {
+        const fieldTokens = tokenize(`${m.title} ${m.tags.join(" ")} ${m.description}`);
+        const hits = expanded.filter((t) => fieldTokens.some((u) => tokenMatch(t, u))).length;
+        if (hits === 0) continue;
+        scored.push(finish(m, hits * FALLBACK_KEYWORD_WEIGHT));
+      }
+    }
+
     scored.sort((a, b) => b.score - a.score);
 
     // P5: 측면억제(RIF) — 상위 결과와 유사한 하위 경쟁 기억은 순위에서만 눌린다.

@@ -267,7 +267,14 @@ server.registerTool(
   async ({ query, type, limit, include_linked, project }) => {
     const scope = project === undefined ? DEFAULT_PROJECT : project || undefined;
     const results = store.search(query, { type, limit, includeLinked: include_linked, project: scope });
-    if (results.length === 0) return ok({ results: [], note: "No memories matched. Consider `remember` if you learn something durable here." });
+    if (results.length === 0) {
+      // 0건에 곧장 remember 를 권하면 "사실은 있는데 표현이 어긋난" 기억이 중복 저장된다.
+      // 재질의를 먼저 유도한다 (감사 D2).
+      return ok({
+        results: [],
+        note: "No memories matched this query. Before concluding nothing is stored: retry with different wording (synonyms, the other language, a broader single keyword), or call `list_memories` to see what exists. Only use `remember` once you are confident this is genuinely new.",
+      });
+    }
     return ok({ results: results.map(searchHit) });
   },
 );
