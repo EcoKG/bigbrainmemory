@@ -67,7 +67,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
   - 어떻게: vault 에 `createNew(record)` 신설 — `writeFileSync(fp, text, { flag: 'wx' })`, EEXIST 면 `-2, -3…` 접미 재시도 루프. remember 경로에서 makeSlug+write 를 이것으로 교체.
   - 검증: 동시 remember 인터리브에서 두 파일 모두 생존 + 각자 id 로 resolve 성공.
 
-- [ ] **T5. YAML Date 허용** (A6)
+- [x] **T5. YAML Date 허용** (A6) — 완료 2026-07-18
   - 무엇: Obsidian/수동 편집의 비인용 날짜가 Date 객체로 파싱 → str() 가드가 버림 → created 등 4개 필드가 "지금"으로 리셋되어 활성이 부풀고(실측 −2.96→+3.84) 고착된다.
   - 왜: medium — Obsidian 호환을 표방하면서 사용자가 볼트를 만지는 순간 랭킹이 오염된다.
   - 어떻게: `str()`(vault.ts:122) 이 `v instanceof Date → v.toISOString()` 허용. (대안: yaml JSON_SCHEMA 파싱)
@@ -163,6 +163,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
 |---|---|---|
 | 2026-07-18 | 감사 완료 (47건 확정) + 본 계획 수립 | docs/native-parity-audit.md |
 | 2026-07-18 | 네이티브 5건 이관 + 브리지 전환 (SimpleMailServer) | 대체 전략 ④ 실증 |
+| 2026-07-18 | **T5** YAML Date 허용 | `str()` 가 `Date` 인스턴스를 `toISOString()` 으로 수용(Invalid Date 는 기본값). 회귀 `scripts/regress-obsidian-edit.mjs` 신설(1·2절) — 인용 없는 `created: 2025-01-01T…`·날짜만 형식 `2025-02-02` 모두 보존, 기저활성 부풀림 없음, write-back 후에도 고착 안 됨, 기존 형식 왕복 무손실. 전체 105✔/0✘ |
 | 2026-07-18 | **T4** remember 원자적 생성 | `vault.createNew()` 신설 — 직렬화를 `serialize()` 로 분리하고, 임시 파일에 내용을 다 쓴 뒤 `linkSync` 로 거는 방식(대상 존재 시 EEXIST)으로 **배타성과 내용 완전성을 동시에** 확보. `flag:'wx'` 직접 쓰기는 "빈 파일→내용" 창에 다른 프로세스가 절단으로 오인·격리할 수 있어 채택하지 않음. **추가 발견·수정**: supersede 블록이 최종 slug 확정 **전에** `supersededBy` 를 기록해, 충돌로 `-2` 가 붙으면 존재하지 않는 파일을 가리켰다 — 순서를 분리(신규 쪽 표시는 생성 전, 구 기억 역참조는 생성 후). 회귀 5·6절 추가 — 전체 97✔/0✘ |
 | 2026-07-18 | **T3** reinforce 재읽기+증분 | 스냅샷 재직렬화 → 쓰기 직전 `vault.find` 재읽기 후 델타만 적용. 파일이 사라졌으면 write 생략(부활 방지), archive 로 이동했으면 그쪽에 기록. 강화를 **best-effort** 로 전환(쓰기 실패해도 회상은 계속 — T2 발견 사항 해소). 무의미해진 `opts.archived` 파라미터 제거. 회귀 `scripts/regress-concurrency.mjs` 신설(4절) — **강화 소실률 84~99.5% → 0.0%** (2프로세스×300회, 기대 602/실측 602), revise·forget 경쟁 보존 확인. 전체 83✔/0✘ |
 | 2026-07-18 | **T2** 원자적 쓰기 | `writeFileAtomic`(같은 디렉터리 tmp → `renameSync`) 도입, `vault.write`/`writeIndex` 교체. 절단 감지는 T1 에서 선반영됨. 회귀 2절 추가(잔재 없음 / rename 실패 주입 시 원본 바이트 무변형) — 전체 67✔/0✘. **발견**: `MemoryStore.read` 가 내부 reinforce 의 쓰기 실패로 **조회 자체를 던진다**(디스크 만실·읽기전용 시 recall 전면 실패). 강화는 best-effort 여야 하므로 T3 에서 함께 처리 |

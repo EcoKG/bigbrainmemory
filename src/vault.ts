@@ -273,7 +273,16 @@ export class Vault {
   }
 
   private fromFrontmatter(slug: string, data: Record<string, unknown>, body: string): MemoryRecord {
-    const str = (v: unknown, dflt = ""): string => (typeof v === "string" ? v : dflt);
+    // js-yaml 은 **인용부호 없는** 타임스탬프(created: 2025-01-01, 또는 ISO 형태)를
+    // Date 인스턴스로 파싱한다. Obsidian 이나 손편집에서 흔한 형태인데,
+    // 문자열만 통과시키면 created/updated/lastAccessed/lastReinforced 가 전부
+    // 기본값(=지금)으로 리셋돼 오래된 기억의 기저활성이 부풀고(실측 −2.96 → +3.84),
+    // 다음 write 가 그 잘못된 값을 고착시켰다(감사 A6).
+    const str = (v: unknown, dflt = ""): string => {
+      if (typeof v === "string") return v;
+      if (v instanceof Date && !Number.isNaN(v.getTime())) return v.toISOString();
+      return dflt;
+    };
     const num = (v: unknown, dflt: number): number => (typeof v === "number" && Number.isFinite(v) ? v : dflt);
     const arr = (v: unknown): string[] => (Array.isArray(v) ? v.map(String) : []);
     const type = VALID_TYPES.includes(data.type as MemoryType) ? (data.type as MemoryType) : "semantic";
