@@ -147,10 +147,95 @@ console.log("5) 정상 사용은 정상 강화");
   check("매일 쓰면 꾸준히 강화됨", n >= 4, `strength=${n}`);
 }
 
+// ── 6. RIF 로 억제된 경쟁자는 강화되지 않는다 (T18/C5)
+console.log("6) 억제된 경쟁자 강화 제외 (C5)");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  s.remember({ title: "타입스크립트 strict 모드 선호", description: "코드 리뷰에서 strict true 를 요구함", content: "본문 A.", type: "preference" });
+  s.remember({ title: "타입스크립트 strict 모드 선호함", description: "코드 리뷰에서 strict true 를 요구함", content: "본문 B.", type: "preference" });
+  for (const slug of ["타입스크립트-strict-모드-선호", "타입스크립트-strict-모드-선호함"]) {
+    aged(dir, slug, 24);
+    waited(dir, slug, 5 * 60);
+  }
+  const before = ["타입스크립트-strict-모드-선호", "타입스크립트-strict-모드-선호함"].map((x) => strengthOf(dir, x));
+
+  const q = new MemoryStore(new Vault(dir));
+  const r = q.search("타입스크립트 strict");
+  const inhibited = r.filter((x) => x.inhibited).map((x) => x.record.slug);
+  check("근접 중복 한쪽이 RIF 로 억제됨(전제 확인)", inhibited.length === 1, inhibited.join(","));
+
+  const after = ["타입스크립트-strict-모드-선호", "타입스크립트-strict-모드-선호함"].map((x) => strengthOf(dir, x));
+  const winner = r.find((x) => !x.inhibited).record.slug;
+  const loser = inhibited[0];
+  check("승자는 강화됨", strengthOf(dir, winner) > before[0], `${before} → ${after}`);
+  check("억제된 경쟁자는 강화되지 않음 (종전 동률 적립)", strengthOf(dir, loser) === 1, `loser=${strengthOf(dir, loser)}`);
+}
+
+// ── 7. 연상 이웃은 강화되지 않는다 (T18/C5)
+console.log("7) 연상 이웃 강화 제외 (C5)");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  s.remember({ title: "허브 노트", description: "중심 문서", content: "빅터 본문.", type: "semantic" });
+  s.remember({ title: "이웃 노트", description: "연결된 문서", content: "무관 본문.", type: "semantic" });
+  s.link("허브-노트", "이웃-노트", "연결");
+  for (const slug of ["허브-노트", "이웃-노트"]) {
+    aged(dir, slug, 24);
+    waited(dir, slug, 5 * 60);
+  }
+
+  const r = new MemoryStore(new Vault(dir)).search("빅터");
+  check("연상으로 이웃이 딸려옴(전제 확인)", r.some((x) => x.snippet.startsWith("(연상")), r.map((x) => x.record.slug).join(","));
+  check("허브는 강화됨", strengthOf(dir, "허브-노트") > 1, `hub=${strengthOf(dir, "허브-노트")}`);
+  check("연상 이웃은 강화되지 않음 (종전 +0.5)", strengthOf(dir, "이웃-노트") === 1, `neighbor=${strengthOf(dir, "이웃-노트")}`);
+}
+
+// ── 8. revise 가 간격 게이트를 우회하지 않는다 (T18/C6)
+console.log("8) revise 간격 게이트 준수 (C6)");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  const rec = s.remember({ title: "연속 교정 대상", description: "설명", content: "1차 본문.", type: "semantic" }).record;
+  aged(dir, rec.slug, 240); // 10일 된 기억 → 필요 간격 24시간
+
+  const s2 = new MemoryStore(new Vault(dir));
+  s2.revise(rec.slug, { reason: "1차", content: "2차 본문." });
+  s2.revise(rec.slug, { reason: "2차", content: "3차 본문." });
+  check("몇 초 안 연속 revise 로 부풀지 않음 (종전 1→3)", strengthOf(dir, rec.slug) <= 2, `strength=${strengthOf(dir, rec.slug)}`);
+  check("교정 내용 자체는 반영됨", fs.readFileSync(memPath(dir, rec.slug), "utf-8").includes("3차 본문"));
+
+  // 순수 메타데이터 편집은 강화 대상이 아니다
+  const beforeMeta = strengthOf(dir, rec.slug);
+  waited(dir, rec.slug, 48 * 60); // 간격은 충분히 벌린다
+  s2.revise(rec.slug, { reason: "태그만 변경", tags: ["새태그"] });
+  check("태그만 바꾸는 편집은 강화하지 않음", strengthOf(dir, rec.slug) === beforeMeta, `${beforeMeta} → ${strengthOf(dir, rec.slug)}`);
+}
+
+// ── 9. reflect 가 "확신도 높아 제외된" 건수를 노출한다 (T18/C6)
+console.log("9) 확신도 게이트로 제외된 건수 노출 (C6)");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  for (let i = 0; i < 10; i++) {
+    s.remember({ title: `줄루 기억 ${i}`, description: `설명 ${i}`, content: `본문 ${i}.`, type: "semantic", confidence: 0.9 });
+  }
+  // created 뿐 아니라 last_reinforced 도 되감아야 실제로 "방치된" 상태가 된다
+  // (T12 이후 활성은 마지막 강화 시점을 반영하므로, created 만 옮기면 활성이 높게 나온다)
+  for (let i = 0; i < 10; i++) {
+    aged(dir, `줄루-기억-${i}`, 8760);
+    waited(dir, `줄루-기억-${i}`, 8760 * 60);
+  }
+
+  const rep = new MemoryStore(new Vault(dir)).reflect();
+  check("망각 후보는 0건 (확신도 0.9)", rep.forgetCandidates.length === 0);
+  check("제외된 건수가 노출됨", rep.trustedButFaded > 0, `trustedButFaded=${rep.trustedButFaded}`);
+}
+
 for (const d of cleanups) fs.rmSync(d, { recursive: true, force: true });
 
 if (failures > 0) {
   console.error(`\n실패: ${failures}건`);
   process.exit(1);
 }
-console.log("\nT14 확장 간격 회귀 테스트 통과 ✔");
+console.log("\nT14/T18 간격·강화 정밀화 회귀 테스트 통과 ✔");

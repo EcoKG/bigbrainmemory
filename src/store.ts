@@ -535,11 +535,18 @@ export class MemoryStore {
       results = results.concat(assoc.slice(0, Math.max(1, Math.ceil(limit / 2))));
     }
 
-    // P4: 능동 회상 → 상위 결과 강화 (연상으로만 딸려온 것은 약하게)
-    const direct = new Set(results.filter((r) => !r.snippet.startsWith("(연상")).map((r) => r.record.slug));
+    // P4/P5: 능동 회상 → 강화. 단 **억제된 경쟁자와 연상 이웃은 강화하지 않는다**(감사 C5).
+    //
+    // 종전에는 반환 목록 전체를 강화해서, RIF 로 순위를 눌러놓고도 같은 델타를 줬다.
+    // 그래서 중복 쌍이 질의마다 나란히 +1 씩 받아 저장강도가 영원히 동률로 가고,
+    // RIF 의 목적(미래 간섭 감소)이 세션 간 전혀 실현되지 않았다.
+    // 연상 이웃도 "목록에 스쳤을 뿐 실제로 인출된 것" 이 아니므로 강화 대상에서 뺀다 —
+    // 자주 질의되는 주제의 이웃들이 실사용과 무관하게 일괄 적립되던 문제를 막는다.
+    // (연상 이웃을 정말 쓴 경우엔 이어지는 read_memory 가 수동 강화를 준다)
     for (const r of results) {
-      const isDirect = direct.has(r.record.slug);
-      this.reinforce(r.record, { active: isDirect, preActivation: r.activation });
+      const isAssoc = r.snippet.startsWith("(연상");
+      if (isAssoc || r.inhibited) continue;
+      this.reinforce(r.record, { active: true, preActivation: r.activation });
     }
     return { results, totalMatched: kept.length };
   }
@@ -574,9 +581,19 @@ export class MemoryStore {
     if (input.source !== undefined) m.source = input.source;
     if (input.project !== undefined) m.project = input.project || undefined; // 빈 문자열 = 전역으로 되돌리기
     this.ensureBodyLinks(m); // 본문 교체로 연상 링크가 소실되지 않도록 복원
-    // 재공고화: 재확인/갱신은 기억을 강화하고 최근성 시계를 갱신
-    m.storageStrength += 1;
-    m.lastReinforced = nowIso();
+
+    // 재공고화: 재확인/갱신은 기억을 강화하고 최근성 시계를 갱신.
+    // **간격 게이트를 우회하지 않는다**(감사 C6): 종전에는 revise 가 무조건 +1 이라
+    // 몇 초 안에 두 번 고치면 1→3 이 됐고, lastReinforced 리셋으로 다음 정상 강화의
+    // 기준선까지 흔들렸다. instructions 가 중복 대신 revise 를 권하므로 한 세션에서
+    // 여러 번 다듬는 것은 정상 경로이고, P3(간격 둔 강화만 인정)와 정면으로 어긋났다.
+    // 또한 태그만 바꾸는 순수 메타데이터 편집은 "재확인" 이 아니므로 강화하지 않는다.
+    const substantive = contentChanged || input.confidence !== undefined;
+    const spacingOk = Date.now() - Date.parse(m.lastReinforced) >= requiredSpacing(m, Date.now());
+    if (substantive && spacingOk) {
+      m.storageStrength += 1;
+      m.lastReinforced = nowIso();
+    }
     m.lastAccessed = nowIso();
     m.updated = nowIso();
     m.history.push(
@@ -622,6 +639,8 @@ export class MemoryStore {
     counts: { total: number; byType: Record<string, number>; byStatus: Record<string, number> };
     weakened: { slug: string; title: string; activation: number; confidence: number }[];
     forgetCandidates: { slug: string; title: string; activation: number; confidence: number }[];
+    /** 약해졌지만 확신도가 높아 망각 후보에서 제외된 건수 (P6 의 보수적 설계, 감사 C6) */
+    trustedButFaded: number;
     lowConfidence: MemoryRecord[];
     duplicates: [string, string][];
     orphans: MemoryRecord[];
@@ -659,6 +678,10 @@ export class MemoryStore {
     const faded = withAct.filter((x) => x.matured && x.act < RETRIEVAL_THRESHOLD).sort((a, b) => a.act - b.act);
     const cap = Math.floor(active.length * WEAKENED_RATIO);
     const weakened = faded.slice(0, cap).map(brief);
+    // P6 는 "진실하다고 믿는 기억은 접근성 저하만으로 버리지 않는다" 는 보수적 설계라
+    // 확신도가 높으면 아무리 방치돼도 망각 후보에 오르지 않는다. 그 자체는 타당하지만
+    // 그런 기억이 몇 건인지 안 보이면 정리 판단이 방치된다 — 카운트만 노출한다 (감사 C6).
+    const trustedButFaded = faded.filter((x) => x.m.confidence >= 0.5).length;
     // 망각 후보 = 약해졌고(활성 낮음) + 확신도도 낮음 (적응적 망각 후보, 실제 삭제는 AI 판단).
     // 확신도 게이트가 이미 강력한 필터라 분위 상한은 걸지 않되, 유예기간은 동일하게 적용한다.
     const forgetCandidates = faded.filter((x) => x.m.confidence < 0.5).map(brief);
@@ -675,7 +698,15 @@ export class MemoryStore {
       }
     }
     const orphans = active.filter((m) => m.links.length === 0);
-    return { counts: { total: all.length, byType, byStatus }, weakened, forgetCandidates, lowConfidence, duplicates, orphans };
+    return {
+      counts: { total: all.length, byType, byStatus },
+      weakened,
+      forgetCandidates,
+      trustedButFaded,
+      lowConfidence,
+      duplicates,
+      orphans,
+    };
   }
 
   list(opts?: { type?: MemoryType; status?: MemoryStatus; project?: string }): MemoryRecord[] {

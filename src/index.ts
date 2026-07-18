@@ -392,6 +392,7 @@ server.registerTool(
       counts: r.counts,
       weakened_hard_to_recall: r.weakened,
       forget_candidates: r.forgetCandidates,
+      trusted_but_faded: r.trustedButFaded,
       low_confidence: r.lowConfidence.map((m) => ({ slug: m.slug, title: m.title, confidence: m.confidence })),
       possible_duplicates: r.duplicates,
       orphans_without_links: r.orphans.map((m) => m.slug),
