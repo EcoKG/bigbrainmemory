@@ -49,7 +49,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
   - 어떻게: ① `Vault.read`(vault.ts:53-55) 를 try/catch — 실패 시 stderr 경고 + null 반환 (loadAll 은 이미 null 스킵) ② 손상 파일은 `vault/quarantine/` 으로 이동 ③ `main()`(index.ts:261) 의 regenerateIndex 도 try/catch ④ `fromFrontmatter` 가 id 부재 시 손상 간주 null ⑤ 파싱 유래 불확실 레코드는 write 금지 (캐시 세탁 차단).
   - 검증: 임시 볼트에 정상 1 + 손상 1 → 서버 기동 성공, 정상 기억 조회 가능, 손상 파일 quarantine 이동, 원본 바이트 무변형.
 
-- [ ] **T2. 원자적 쓰기** (A3 + A8)
+- [x] **T2. 원자적 쓰기** (A3 + A8) — 완료 2026-07-18
   - 무엇: `vault.write`/`writeIndex`(vault.ts:90,101) 가 writeFileSync 직접 덮어쓰기 — 크래시 시 찢긴 파일이 예외 없이 body='' 로 읽혀 고착된다.
   - 왜: high — 진짜 데이터 손실이 무음으로 일어나고 다음 write 가 확정한다. Obsidian 동시 저장이 현실적 트리거.
   - 어떻게: `fp + '.tmp-' + process.pid` 에 쓰고 `fs.renameSync(tmp, fp)` (동일 볼륨 = 원자적). read 경로에 최소 무결성 검증(닫는 `---` 존재) 실패 시 write-back 생략.
@@ -163,5 +163,6 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
 |---|---|---|
 | 2026-07-18 | 감사 완료 (47건 확정) + 본 계획 수립 | docs/native-parity-audit.md |
 | 2026-07-18 | 네이티브 5건 이관 + 브리지 전환 (SimpleMailServer) | 대체 전략 ④ 실증 |
+| 2026-07-18 | **T2** 원자적 쓰기 | `writeFileAtomic`(같은 디렉터리 tmp → `renameSync`) 도입, `vault.write`/`writeIndex` 교체. 절단 감지는 T1 에서 선반영됨. 회귀 2절 추가(잔재 없음 / rename 실패 주입 시 원본 바이트 무변형) — 전체 67✔/0✘. **발견**: `MemoryStore.read` 가 내부 reinforce 의 쓰기 실패로 **조회 자체를 던진다**(디스크 만실·읽기전용 시 recall 전면 실패). 강화는 best-effort 여야 하므로 T3 에서 함께 처리 |
 | 2026-07-18 | **T1** 손상 파일 파싱 격리 | `Vault.read` 가 예외 대신 null 반환 + `quarantine/` 이동(원본 바이트 보존), 빈 파일·절단 파일 사전 감지, `main()` regenerateIndex try/catch. **계획 대비 변경 2건**: ④ "id 부재 시 손상 간주"는 **미채택** — gray-matter 에 옵션 객체를 넘겨 캐시 경로 자체를 차단(A2 세탁 벡터가 구조적으로 소멸)했고, id 부재 판정은 frontmatter 없는 손수 작성 Obsidian 노트를 격리해버려 Obsidian 호환을 해친다(회귀 테스트 5번이 이를 방어). ⑤ "불확실 레코드 write 금지"는 read 가 null 을 반환하게 되어 자동 해소. 회귀 `scripts/regress-corruption.mjs` 21건 신설 — 전체 59✔/0✘ |
 | 2026-07-18 | **T0** .mcp.json 죽은 경로 수정 | `D:/BigBrainMemory/dist/index.js` → `./dist/index.js`, `env.BIGBRAIN_VAULT` 제거(기본값 `<repo>/vault` 위임). 회귀 테스트 `scripts/regress-mcp-config.mjs` 신설 + `npm test` 에 편입 — 스모크 22 + 설정 11 전부 통과. 라이브 볼트 무변형(19건 유지) 확인. ※ 검증란의 "Claude Code 재시작 → /mcp 확인"은 세션 내 불가라 **동일 스폰 계약(cwd=저장소 루트, 같은 command/args)을 프로그램으로 재현**해 8개 도구 등록까지 확인하는 방식으로 대체함 — 사용자가 이 레포를 프로젝트로 열 때 최종 육안 확인 필요 |

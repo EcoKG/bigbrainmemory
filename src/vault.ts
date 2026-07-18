@@ -34,6 +34,29 @@ function errText(err: unknown): string {
 }
 
 /**
+ * 원자적 파일 쓰기 — 같은 디렉터리의 임시 파일에 완전히 쓴 뒤 rename 으로 교체한다.
+ * rename 은 같은 볼륨 안에서 원자적이므로, 다른 프로세스나 크래시가
+ * "반쯤 쓰인 파일" 을 관측하는 창 자체가 사라진다(감사 A3/A8).
+ *
+ * 기존의 writeFileSync 직접 덮어쓰기는 닫는 `---` 앞에서 잘린 파일을 남길 수 있었고,
+ * 그런 파일은 gray-matter 가 예외 없이 body='' 로 읽어 다음 write 가 고착시켰다.
+ */
+function writeFileAtomic(fp: string, text: string): void {
+  const tmp = `${fp}.tmp-${process.pid}-${Date.now().toString(36)}`;
+  try {
+    fs.writeFileSync(tmp, text, "utf-8");
+    fs.renameSync(tmp, fp);
+  } catch (err) {
+    try {
+      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    } catch {
+      /* 임시 파일 정리 실패는 원 오류를 가리지 않도록 무시 */
+    }
+    throw err;
+  }
+}
+
+/**
  * 마크다운 볼트(Obsidian 호환)에 대한 저수준 파일 입출력.
  * vault/
  *   memories/  — 활성 기억 (*.md)
@@ -163,7 +186,7 @@ export class Vault {
     if (record.supersededBy) fm.superseded_by = record.supersededBy;
     if (record.archiveReason) fm.archive_reason = record.archiveReason;
     const text = matter.stringify(`\n${record.body}\n`, fm);
-    fs.writeFileSync(this.filePath(record.slug, archived), text, "utf-8");
+    writeFileAtomic(this.filePath(record.slug, archived), text);
   }
 
   /** 활성 기억을 archive/로 이동 */
@@ -174,7 +197,7 @@ export class Vault {
   }
 
   writeIndex(markdown: string): void {
-    fs.writeFileSync(path.join(this.root, "MEMORY.md"), markdown, "utf-8");
+    writeFileAtomic(path.join(this.root, "MEMORY.md"), markdown);
   }
 
   /** 제목에서 Windows/Obsidian 호환 파일명 slug 생성 (한글 등 유니코드 유지) */
