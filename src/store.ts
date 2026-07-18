@@ -14,15 +14,27 @@ const DAY_MS = 86_400_000;
 // --- 리포트(docs/memory-model-report.md) 기반 파라미터 -------------------
 /** ACT-R 기저활성 감쇠 파라미터 (거듭제곱 망각). 기본 0.5 = ACT-R 표준 */
 const DECAY_D = 0.5;
-/** 회상/reflect에서 "약해진 기억"으로 보는 기저활성 임계 τ (P6) */
-const RETRIEVAL_THRESHOLD = -0.7;
+/**
+ * 회상/reflect에서 "약해진 기억"으로 보는 기저활성 임계 τ (P6).
+ *
+ * 활성식을 최근 연습항 분리형으로 바꾸면서(감사 C1) 척도가 통째로 내려갔다:
+ * 종전 근사식은 n=1 구간에서 상수항 `ln(1/(1−d))` = ln(2) ≈ 0.693 을 얹고 있었는데
+ * 새 식에는 그 항이 없다. 그래서 임계도 **같은 폭만큼 내려야** 종전 판정이 보존된다.
+ * (검산: n=1 기억이 τ 를 밑도는 시점이 종전과 동일하게 약 16.2시간)
+ */
+const RETRIEVAL_THRESHOLD = -0.7 - Math.log(1 / (1 - 0.5)); // ≈ -1.393
 /** 간격 게이트 — 직전 강화 후 이 시간이 지나야 저장강도 증가 (P3, 간격효과). 환경변수로 조정 */
 const SPACING_WINDOW_MS = (() => {
   const v = Number(process.env.BIGBRAIN_SPACING_MS);
   return Number.isFinite(v) && v >= 0 ? v : 10 * 60_000; // 기본 10분
 })();
-/** 인출강도가 이 값 미만이면 "어렵게 찾은" 회상 → 바람직한 어려움 보너스 (P4) */
-const HARD_RETRIEVAL_ACTIVATION = 0.5;
+/**
+ * 인출강도가 이 값 미만이면 "어렵게 찾은" 회상 → 바람직한 어려움 보너스 (P4).
+ * τ 와 같은 이유로 ln(2) 만큼 함께 내렸다(위 RETRIEVAL_THRESHOLD 주석 참조).
+ * C1 수정 덕에 이제 **마지막 강화가 최근이면 활성이 높아 보너스가 자동으로 빠진다** —
+ * 종전에는 감쇠 시계가 created 고정이라 매일 쓰는 기억도 "어렵게 찾은" 것으로 쳤다.
+ */
+const HARD_RETRIEVAL_ACTIVATION = 0.5 - Math.log(1 / (1 - 0.5)); // ≈ -0.193
 /**
  * 간격 게이트에 막힌 접근도 매번 디스크에 기록할지 (기본 false).
  * accessCount/lastAccessed 는 활성 계산에 쓰이지 않는 표시용 필드라, 조회마다 쓰면
@@ -67,18 +79,44 @@ function overlap(a: string[], b: string[]): number {
 }
 
 /**
- * ACT-R 기저활성 (거듭제곱 망각) — 리포트 P2.
- *   B = ln( n / (1 − d) ) − d · ln(L)
- *   n = 저장강도(빈도), L = 경과시간[시], d = 감쇠(0.5, ACT-R 기본값)
- * 이 식은 ACT-R의 표준 "optimized learning" 근사식(Anderson & Lebiere 1998,
- * Anderson & Schooler 1991의 합리적 분석 기반)이다. 정확식 B = ln(Σ t_j^−d)의
- * 저비용 근사이며, Petrov(2006)의 하이브리드 근사와는 다른 별개의 식이다.
- * 지수 망각곡선(에빙하우스) 대신 거듭제곱 법칙을 채택했다.
+ * ACT-R 기저활성 (거듭제곱 망각) — 리포트 P2, **최근 연습항 분리형**.
+ *
+ *   B = ln( (n−1)·L^−d / (1−d)  +  t_last^−d )
+ *   n = 저장강도(빈도), L = 생성 후 경과[시], t_last = 마지막 강화 후 경과[시], d = 0.5
+ *
+ * 종전에는 순수 optimized-learning 근사식 `ln(n/(1−d)) − d·ln(L)` 을 썼는데,
+ * 이 식은 **연습이 생애 전체에 균등 분포한다**는 전제 위에서만 성립한다.
+ * 실사용은 불균등하게 강화되므로 전제가 깨지고, 그 결과 감쇠 시계가 사실상
+ * "생성 시각"에만 묶여 최근성이 랭킹에 전혀 반영되지 않았다(감사 C1):
+ * created 와 n 이 같으면 **어제 강화한 기억과 1년 방치한 기억의 활성이 완전히 동일**했고
+ * (실측 둘 다 −2.2364), 어제 5회 쓴 핵심 기억이 몇 초 전 저장한 잡메모에 밀렸다
+ * (5.75 vs 7.68). 도구 설명이 광고하던 "frequency+recency" 중 recency 는 허위였다.
+ *
+ * 이제 **마지막 1회를 정확항 t_last^−d 로 분리**하고 나머지 n−1 회만 근사한다
+ * (Petrov 2006 하이브리드 근사의 k=1 형태). 정확식 B = ln(Σ t_j^−d) 의 방향·간격을
+ * 잘 따라간다 — 위 시나리오에서 정확식 −1.40/−2.93 대비 이 식은 −1.24/−2.34 로
+ * 순서와 격차를 모두 복원한다. 스키마 변경은 없다(lastReinforced 는 이미 저장 중).
+ *
+ * n=1 일 때는 tail 이 0 이라 B = −d·ln(t_last) 로, 정확식과 **완전히 일치**한다.
+ * (종전 근사식은 이 구간에서 +ln(2)≈0.69 만큼 과대평가했다)
  */
-function baseLevelActivation(storageStrength: number, ageMs: number): number {
+function baseLevelActivation(storageStrength: number, ageMs: number, sinceLastReinforceMs: number): number {
   const n = Math.max(1, storageStrength);
-  const ageHours = Math.max(ageMs, 60_000) / HOUR_MS; // 최소 1분 → 0 나눗셈/음수 폭주 방지
-  return Math.log(n / (1 - DECAY_D)) - DECAY_D * Math.log(ageHours);
+  const L = Math.max(ageMs, 60_000) / HOUR_MS; // 최소 1분 → 0 나눗셈/음수 폭주 방지
+  // 마지막 강화는 생성보다 앞설 수 없다. 값이 깨졌으면 생성 시각으로 폴백.
+  const raw = Number.isFinite(sinceLastReinforceMs) ? Math.min(sinceLastReinforceMs, ageMs) : ageMs;
+  const tLast = Math.max(raw, 60_000) / HOUR_MS;
+  const tail = ((n - 1) * L ** -DECAY_D) / (1 - DECAY_D);
+  return Math.log(tail + tLast ** -DECAY_D);
+}
+
+/** 레코드로부터 기저활성을 계산 — 감쇠 시계 인자를 한 곳에서만 조립한다 */
+function activationOf(m: MemoryRecord, now: number = Date.now()): number {
+  return baseLevelActivation(
+    m.storageStrength,
+    now - Date.parse(m.created),
+    now - Date.parse(m.lastReinforced),
+  );
 }
 
 /** 활성값을 (0,1) 인출강도로 압축 (로지스틱) */
@@ -227,7 +265,7 @@ export class MemoryStore {
       }
       if (keyword === 0) continue;
 
-      const activation = baseLevelActivation(m.storageStrength, now - Date.parse(m.created));
+      const activation = activationOf(m, now);
       let score = keyword;
       score *= 0.5 + 0.5 * m.confidence; // P1: 진실성 가중 (인출과 독립)
       score *= 0.55 + 0.9 * retrievalStrength(activation); // P2: 기저활성(빈도·최근성) 가중
@@ -268,7 +306,7 @@ export class MemoryStore {
           // 연상으로도 스코프 밖 기억이 새어 들어오면 안 된다
           if (found && found.record.status === "active" && this.inScope(found.record, opts?.project)) {
             have.add(linkSlug);
-            const act = baseLevelActivation(found.record.storageStrength, now - Date.parse(found.record.created));
+            const act = activationOf(found.record, now);
             assoc.push({
               record: found.record,
               score: r.score * 0.3,
@@ -294,7 +332,7 @@ export class MemoryStore {
   read(idOrSlug: string): MemoryRecord | null {
     const found = this.resolve(idOrSlug);
     if (!found) return null;
-    const act = baseLevelActivation(found.record.storageStrength, Date.now() - Date.parse(found.record.created));
+    const act = activationOf(found.record);
     this.reinforce(found.record, { active: false, preActivation: act });
     return found.record;
   }
@@ -385,7 +423,7 @@ export class MemoryStore {
     // 기저활성이 임계 τ 미만 = 오래 안 쓰여 약해진(회상 곤란) 기억
     const withAct = active.map((m) => ({
       m,
-      act: baseLevelActivation(m.storageStrength, now - Date.parse(m.created)),
+      act: activationOf(m, now),
     }));
     const weakened = withAct
       .filter((x) => x.act < RETRIEVAL_THRESHOLD)

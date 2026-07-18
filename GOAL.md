@@ -113,7 +113,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
 
 ## Phase P2 — 랭킹·검색 품질
 
-- [ ] **T12. 감쇠 시계에 최근성 복원** (C1 — 최대 이론 결함)
+- [x] **T12. 감쇠 시계에 최근성 복원** (C1 — 최대 이론 결함) — 완료 2026-07-18
   - 무엇: 활성 계산 4곳 전부 `now − created` — lastAccessed 는 어디서도 안 읽힌다. "어제 강화"와 "1년 방치"가 활성 완전 동일(−2.2364, 실측). 도구 설명의 "recency" 는 허위.
   - 왜: high — 오래됐지만 활발히 쓰는 핵심 기억이 방금 저장한 잡메모에 밀린다(5.75 vs 7.68 실측). reflect 도 어제 쓴 기억을 weakened 오분류.
   - 어떻게: 마지막 연습 항 분리 — `B = ln((n−1)·L^−d/(1−d) + t_last^−d)`, L=created 경과[h], t_last=lastReinforced 경과[h]. 실측 검증됨(A=−1.24, B=−2.34 — 정확식 방향·간격 근사, 순서 복원). 4개 호출처(store.ts:202,242,272,358) 일괄 교체. C4(어려움 보너스 오발동)는 자동 해소.
@@ -163,6 +163,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
 |---|---|---|
 | 2026-07-18 | 감사 완료 (47건 확정) + 본 계획 수립 | docs/native-parity-audit.md |
 | 2026-07-18 | 네이티브 5건 이관 + 브리지 전환 (SimpleMailServer) | 대체 전략 ④ 실증 |
+| 2026-07-18 | **T12** 감쇠 시계 최근성 복원 | `B = ln((n−1)·L^−d/(1−d) + t_last^−d)` 로 교체, 호출 4곳을 `activationOf(m, now)` 헬퍼로 통일. 실측: 어제 강화 −1.24 vs 1년 방치 −2.34 (종전 둘 다 −2.2364로 동일) — 감사 산출값과 일치. **계획에 없던 필수 동반 수정**: 새 식은 n=1 구간에서 종전 근사식의 상수항 `ln(2)` 가 빠져 척도가 통째로 내려간다. τ(−0.7)와 어려움 임계(0.5)를 **같은 폭만큼** 내려 종전 판정을 보존했다(검산: n=1 이 τ 를 밑도는 시점이 종전과 동일한 16.2시간). 이 재보정 없이는 reflect 가 어제 쓴 기억까지 weakened 로 오분류한다. C4(어려움 보너스)는 최근성 반영으로 해소 — 동일 created·n 에서 마지막 강화 시점만으로 판정이 갈리는 것을 테스트로 고정. **사고 1건**: PowerShell 텍스트 치환으로 store.ts 의 UTF-8 한글이 깨져 `git checkout` 으로 복원 후 Edit 도구로 재작업(이후 소스 편집은 Edit 도구만 사용). 회귀 `scripts/regress-activation.mjs` 신설(17건) — 전체 212✔/0✘ |
 | 2026-07-18 | **P1 완료 — 대체 선언 가능** | P0+P1 11/11. 회귀 테스트 8종 195✔/0✘ |
 | 2026-07-18 | **T11** 조회 write 절감 | 간격 게이트가 닫혀 delta=0 이면 `reinforce` 가 쓰기를 생략(`BIGBRAIN_FLUSH_EVERY_ACCESS=1` 로 종전 동작 복원 가능). `MEMORY.md` 본문의 생성 시각 제거 + 내용 동일 시 `writeIndex` 생략 → 서버 기동만으로 diff 생기던 문제 해소. **테스트 강화**: 게이트가 닫히면 A 가 아예 안 써서 A4 경쟁 테스트가 공허해지므로, `raceOnce` 가 `last_reinforced` 를 되감아 **실제로 write-back 이 일어나는 위험 경로**를 검증하도록 수정. 소실률 측정도 부수효과 없는 파일 직접 읽기로 변경(기대 600/실측 600). 회귀 `scripts/regress-quiet-read.mjs` 신설(10건) — 전체 195✔/0✘ |
 | 2026-07-18 | **T10** staleness 노출 | `ageInfo()` 가 `updated`/`age_days`/`stale_hint`(기본 30일, `BIGBRAIN_STALE_DAYS`) 를 `brief()` 에 주입 → recall·read_memory·list_memories 일괄 반영. instructions 에 "기억은 시점 관측이지 현재 상태가 아니다 — 코드/경로/버전 인용 시 대조 후 사용" 지침 추가. **버그 하나 잡음**: `Number(env) \|\| 기본값` 이 `0` 을 falsy 로 먹어 임계 0 설정이 무시됐다 — 저장소가 `SPACING_WINDOW_MS` 에서 쓰는 관용구로 통일(`INDEX_LIMIT` 도 동일 수정, 0 이면 인덱스 생략). 회귀 `scripts/regress-staleness.mjs` 신설(17건) — 전체 185✔/0✘ |
