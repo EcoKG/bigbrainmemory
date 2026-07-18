@@ -164,6 +164,11 @@ export class Vault {
   }
 
   write(record: MemoryRecord, archived = false): void {
+    writeFileAtomic(this.filePath(record.slug, archived), this.serialize(record));
+  }
+
+  /** 레코드를 frontmatter + 본문 마크다운 문자열로 직렬화 (slug 와 무관 — slug 는 파일명) */
+  private serialize(record: MemoryRecord): string {
     const fm: Record<string, unknown> = {
       id: record.id,
       title: record.title,
@@ -185,8 +190,58 @@ export class Vault {
     if (record.supersedes) fm.supersedes = record.supersedes;
     if (record.supersededBy) fm.superseded_by = record.supersededBy;
     if (record.archiveReason) fm.archive_reason = record.archiveReason;
-    const text = matter.stringify(`\n${record.body}\n`, fm);
-    writeFileAtomic(this.filePath(record.slug, archived), text);
+    return matter.stringify(`\n${record.body}\n`, fm);
+  }
+
+  /**
+   * 신규 기억을 **원자적으로 생성**한다. 사용된 최종 slug 를 반환하고 record.slug 도 갱신한다.
+   *
+   * makeSlug 의 exists() 검사와 write 사이에는 유사기억 탐지를 위한 전체 볼트 재독이 끼어
+   * 창이 넓었고, write 가 배타 플래그 없는 writeFileSync 라 두 프로세스가 같은 제목을
+   * 동시에 remember 하면 같은 slug 를 배정받아 나중 write 가 앞 기억을 통째로 덮었다
+   * (감사 A5 — 양쪽 다 성공 응답을 받는데 파일은 1개, 패자는 무흔적 소실).
+   *
+   * flag:'wx' 는 "파일이 이미 있으면 실패" 를 OS 수준에서 보장하므로,
+   * EEXIST 면 다음 접미(-2, -3 …)로 재시도해 두 기억이 모두 살아남는다.
+   */
+  createNew(record: MemoryRecord): string {
+    const text = this.serialize(record); // 내용은 slug 와 무관하므로 한 번만 만든다
+    const base = record.slug;
+    for (let n = 1; n < 1000; n++) {
+      const slug = n === 1 ? base : `${base}-${n}`;
+      // archive/ 에 같은 이름이 있으면 망각된 기억이 되살아난 것처럼 보이므로 건너뛴다
+      if (fs.existsSync(this.filePath(slug, true))) continue;
+      if (this.tryCreateExclusive(this.filePath(slug, false), text)) {
+        record.slug = slug;
+        return slug;
+      }
+    }
+    throw new Error(`slug 확보 실패 (1000회 시도): ${base}`);
+  }
+
+  /**
+   * 대상 경로에 파일을 **원자적으로 생성**한다. 이미 있으면 false (덮어쓰지 않는다).
+   * 임시 파일에 내용을 다 쓴 뒤 linkSync 로 거는 이유: rename 은 대상을 덮어쓰므로
+   * 배타성을 잃고, 반대로 flag:'wx' 로 대상에 직접 쓰면 "빈 파일 → 내용" 사이의
+   * 창에 다른 프로세스가 읽어 절단 파일로 오인(격리)할 수 있다. link 는 대상이
+   * 이미 있으면 EEXIST 로 실패하므로 배타성과 내용 완전성을 동시에 만족한다.
+   */
+  private tryCreateExclusive(fp: string, text: string): boolean {
+    const tmp = `${fp}.tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    fs.writeFileSync(tmp, text, { encoding: "utf-8", flag: "wx" });
+    try {
+      fs.linkSync(tmp, fp);
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw err;
+    } finally {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        /* 임시 파일 정리 실패는 무시 */
+      }
+    }
   }
 
   /** 활성 기억을 archive/로 이동 */

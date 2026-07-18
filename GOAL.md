@@ -61,7 +61,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
   - 어떻게: `reinforce`(store.ts:423) 시작에서 `const fresh = this.vault.find(m.slug)` — 파일이 없거나 archive 로 이동했으면 write 생략, 있으면 fresh.record 에 delta(accessCount+1, 조건부 strength)만 적용해 write. 스냅샷 레코드를 직접 쓰지 않는다.
   - 검증: 감사의 결정적 인터리브 3종(revise 보존 / forget 유지 / 2프로세스 300회 강화 소실률 <5%) 회귀 테스트.
 
-- [ ] **T4. remember 원자적 생성** (A5)
+- [x] **T4. remember 원자적 생성** (A5) — 완료 2026-07-18
   - 무엇: makeSlug 의 exists() 와 write 사이 TOCTOU — 동시 동일 제목 remember 가 같은 slug 를 받아 한쪽이 무흔적 소실.
   - 왜: high — 두 세션이 같은 교훈을 동시에 저장하는 상관 시나리오에서 발생. 재현 확정.
   - 어떻게: vault 에 `createNew(record)` 신설 — `writeFileSync(fp, text, { flag: 'wx' })`, EEXIST 면 `-2, -3…` 접미 재시도 루프. remember 경로에서 makeSlug+write 를 이것으로 교체.
@@ -163,6 +163,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
 |---|---|---|
 | 2026-07-18 | 감사 완료 (47건 확정) + 본 계획 수립 | docs/native-parity-audit.md |
 | 2026-07-18 | 네이티브 5건 이관 + 브리지 전환 (SimpleMailServer) | 대체 전략 ④ 실증 |
+| 2026-07-18 | **T4** remember 원자적 생성 | `vault.createNew()` 신설 — 직렬화를 `serialize()` 로 분리하고, 임시 파일에 내용을 다 쓴 뒤 `linkSync` 로 거는 방식(대상 존재 시 EEXIST)으로 **배타성과 내용 완전성을 동시에** 확보. `flag:'wx'` 직접 쓰기는 "빈 파일→내용" 창에 다른 프로세스가 절단으로 오인·격리할 수 있어 채택하지 않음. **추가 발견·수정**: supersede 블록이 최종 slug 확정 **전에** `supersededBy` 를 기록해, 충돌로 `-2` 가 붙으면 존재하지 않는 파일을 가리켰다 — 순서를 분리(신규 쪽 표시는 생성 전, 구 기억 역참조는 생성 후). 회귀 5·6절 추가 — 전체 97✔/0✘ |
 | 2026-07-18 | **T3** reinforce 재읽기+증분 | 스냅샷 재직렬화 → 쓰기 직전 `vault.find` 재읽기 후 델타만 적용. 파일이 사라졌으면 write 생략(부활 방지), archive 로 이동했으면 그쪽에 기록. 강화를 **best-effort** 로 전환(쓰기 실패해도 회상은 계속 — T2 발견 사항 해소). 무의미해진 `opts.archived` 파라미터 제거. 회귀 `scripts/regress-concurrency.mjs` 신설(4절) — **강화 소실률 84~99.5% → 0.0%** (2프로세스×300회, 기대 602/실측 602), revise·forget 경쟁 보존 확인. 전체 83✔/0✘ |
 | 2026-07-18 | **T2** 원자적 쓰기 | `writeFileAtomic`(같은 디렉터리 tmp → `renameSync`) 도입, `vault.write`/`writeIndex` 교체. 절단 감지는 T1 에서 선반영됨. 회귀 2절 추가(잔재 없음 / rename 실패 주입 시 원본 바이트 무변형) — 전체 67✔/0✘. **발견**: `MemoryStore.read` 가 내부 reinforce 의 쓰기 실패로 **조회 자체를 던진다**(디스크 만실·읽기전용 시 recall 전면 실패). 강화는 best-effort 여야 하므로 T3 에서 함께 처리 |
 | 2026-07-18 | **T1** 손상 파일 파싱 격리 | `Vault.read` 가 예외 대신 null 반환 + `quarantine/` 이동(원본 바이트 보존), 빈 파일·절단 파일 사전 감지, `main()` regenerateIndex try/catch. **계획 대비 변경 2건**: ④ "id 부재 시 손상 간주"는 **미채택** — gray-matter 에 옵션 객체를 넘겨 캐시 경로 자체를 차단(A2 세탁 벡터가 구조적으로 소멸)했고, id 부재 판정은 frontmatter 없는 손수 작성 Obsidian 노트를 격리해버려 Obsidian 호환을 해친다(회귀 테스트 5번이 이를 방어). ⑤ "불확실 레코드 write 금지"는 read 가 null 을 반환하게 되어 자동 해소. 회귀 `scripts/regress-corruption.mjs` 21건 신설 — 전체 59✔/0✘ |

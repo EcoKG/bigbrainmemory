@@ -143,29 +143,35 @@ export class MemoryStore {
       .filter((m) => m.status === "active")
       .filter((m) => overlap(titleTokens, tokenize(m.title + " " + m.description)) >= 0.45);
 
-    // 기존 기억 대체(supersede)
-    if (input.supersedes) {
-      const old = this.resolve(input.supersedes);
-      if (old && !old.archived) {
-        old.record.status = "superseded";
-        old.record.supersededBy = slug;
-        old.record.updated = now;
-        old.record.history.push(`${today()}: superseded by [[${slug}]]`);
-        this.vault.write(old.record);
-        record.supersedes = old.record.slug;
-        record.history.push(`${today()}: supersedes [[${old.record.slug}]]`);
-      }
+    // 기존 기억 대체(supersede) — 신규 레코드 쪽 표시는 **생성 전에** 해야 본문에 직렬화된다
+    const found = input.supersedes ? this.resolve(input.supersedes) : null;
+    const superseded = found && !found.archived ? found.record : null;
+    if (superseded) {
+      record.supersedes = superseded.slug;
+      record.history.push(`${today()}: supersedes [[${superseded.slug}]]`);
     }
 
-    this.vault.write(record);
+    // 원자적 생성 — slug 확정과 파일 생성이 한 연산이라 동시 remember 가 서로를
+    // 덮어쓰지 못한다(감사 A5). 충돌 시 record.slug 가 -2, -3 … 으로 갱신된다.
+    const finalSlug = this.vault.createNew(record);
+
+    // 구 기억 쪽 역참조는 **최종 slug 확정 뒤에** — 충돌로 -2 가 붙으면
+    // 생성 전 slug 로 기록한 supersededBy 가 없는 파일을 가리키게 된다
+    if (superseded) {
+      superseded.status = "superseded";
+      superseded.supersededBy = finalSlug;
+      superseded.updated = now;
+      superseded.history.push(`${today()}: superseded by [[${finalSlug}]]`);
+      this.vault.write(superseded);
+    }
 
     // 요청된 링크 연결 (양방향)
     for (const target of input.links ?? []) {
-      this.link(slug, target);
+      this.link(finalSlug, target);
     }
 
     this.regenerateIndex();
-    return { record: this.vault.read(slug) ?? record, similar };
+    return { record: this.vault.read(finalSlug) ?? record, similar };
   }
 
   /**

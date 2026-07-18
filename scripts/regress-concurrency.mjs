@@ -169,10 +169,84 @@ for (let i = 0; i < ${N}; i++) s.search("퀘벡");
   check("파일이 손상되지 않음", new MemoryStore(new Vault(dir)).read(rec.slug) !== null);
 }
 
+// ── 5. 동시 동일 제목 remember — 무흔적 소실 없음 (A5)
+console.log("5) 동시 동일 제목 remember (A5)");
+{
+  const dir = freshDir();
+  const vaultA = new Vault(dir);
+  const storeA = new MemoryStore(vaultA);
+  const storeB = new MemoryStore(new Vault(dir));
+
+  // A 가 slug 후보를 정한 직후·파일 생성 전에 B 가 같은 제목으로 완주하도록 창을 연다
+  const origMakeSlug = vaultA.makeSlug.bind(vaultA);
+  let fired = false;
+  let bRec = null;
+  vaultA.makeSlug = (title) => {
+    const s = origMakeSlug(title);
+    if (!fired) {
+      fired = true;
+      bRec = storeB.remember({ title, content: "B 의 본문 MARKER-BBB.", type: "semantic" }).record;
+    }
+    return s;
+  };
+  const aRec = storeA.remember({ title: "동시성 데모 제목", content: "A 의 본문 MARKER-AAA.", type: "semantic" }).record;
+
+  check("경쟁 창이 실제로 열렸음(전제 확인)", fired);
+  check("두 기억이 서로 다른 slug 를 받음", aRec.slug !== bRec.slug, `a=${aRec.slug} b=${bRec.slug}`);
+
+  const files = fs.readdirSync(path.join(dir, "memories")).filter((f) => f.endsWith(".md"));
+  check("파일 2개 모두 존재", files.length === 2, files.join(","));
+  check("임시 파일 잔재 없음", fs.readdirSync(path.join(dir, "memories")).every((f) => !f.includes(".tmp-")));
+  const all = files.map((f) => fs.readFileSync(path.join(dir, "memories", f), "utf-8"));
+  check("A 의 본문 생존", all.some((t) => t.includes("MARKER-AAA")));
+  check("B 의 본문 생존", all.some((t) => t.includes("MARKER-BBB")));
+
+  const s = new MemoryStore(new Vault(dir));
+  check("A 를 id 로 조회 가능", s.resolve(aRec.id)?.record?.id === aRec.id);
+  check("B 를 id 로 조회 가능", s.resolve(bRec.id)?.record?.id === bRec.id);
+  check("A 를 반환된 slug 로 조회 가능", s.resolve(aRec.slug)?.record?.id === aRec.id);
+  check("B 를 반환된 slug 로 조회 가능", s.resolve(bRec.slug)?.record?.id === bRec.id);
+}
+
+// ── 6. slug 충돌 시에도 supersede 역참조가 실제 파일을 가리킨다
+console.log("6) slug 충돌 + supersede 정합성");
+{
+  const dir = freshDir();
+  const vaultA = new Vault(dir);
+  const storeA = new MemoryStore(vaultA);
+  const storeB = new MemoryStore(new Vault(dir));
+
+  const old = storeA.remember({ title: "구 지식", content: "낡은 사실.", type: "semantic" }).record;
+
+  const origMakeSlug = vaultA.makeSlug.bind(vaultA);
+  let fired = false;
+  vaultA.makeSlug = (title) => {
+    const s = origMakeSlug(title);
+    if (!fired) {
+      fired = true;
+      storeB.remember({ title, content: "B 가 선점.", type: "semantic" });
+    }
+    return s;
+  };
+  const neo = storeA.remember({
+    title: "새 지식",
+    content: "갱신된 사실.",
+    type: "semantic",
+    supersedes: old.slug,
+  }).record;
+
+  check("충돌로 접미가 붙었음(전제 확인)", neo.slug !== "새-지식", `slug=${neo.slug}`);
+  const oldAfter = fs.readFileSync(memPath(dir, old.slug), "utf-8");
+  const m = /superseded_by: (\S+)/.exec(oldAfter);
+  check("구 기억에 superseded_by 기록됨", !!m, oldAfter.slice(0, 200));
+  check("superseded_by 가 최종 slug 와 일치", m?.[1] === neo.slug, `by=${m?.[1]} final=${neo.slug}`);
+  check("superseded_by 가 실제 존재하는 파일을 가리킴", fs.existsSync(memPath(dir, m?.[1] ?? "")));
+}
+
 for (const d of cleanups) fs.rmSync(d, { recursive: true, force: true });
 
 if (failures > 0) {
   console.error(`\n실패: ${failures}건`);
   process.exit(1);
 }
-console.log("\nT3 동시성 회귀 테스트 통과 ✔");
+console.log("\nT3/T4 동시성 회귀 테스트 통과 ✔");
