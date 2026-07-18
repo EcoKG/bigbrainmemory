@@ -7,6 +7,56 @@ const VALID_TYPES: MemoryType[] = ["episodic", "semantic", "procedural", "prefer
 const VALID_STATUS: MemoryStatus[] = ["active", "superseded", "archived"];
 
 /**
+ * gray-matter 는 **옵션 없이** 호출되면 파싱 *전에* 원문을 모듈 캐시에 넣는다
+ * (node_modules/gray-matter/index.js 의 `if (!options) { ... matter.cache[...] = file }`).
+ * 그래서 깨진 파일의 1차 파싱이 예외로 죽어도 캐시에는 빈 file 객체가 남고,
+ * 같은 프로세스의 2차 파싱은 그 캐시를 히트해 "빈 frontmatter" 로 조용히 성공한다.
+ * 이 레코드가 그대로 디스크에 write 되면 confidence/storage_strength/created/history 가
+ * 전부 기본값으로 세탁된다(감사 A2 — 재현 확정).
+ *
+ * 옵션 객체를 넘기면 캐시 경로 자체를 타지 않으므로 세탁 벡터가 구조적으로 사라진다.
+ * (부수 효과: 파일 내용 전체를 키로 쓰는 무제한 캐시의 메모리 누수도 함께 제거)
+ */
+const MATTER_OPTIONS: Record<string, never> = {};
+
+/**
+ * 절단 감지 — 여는 `---` 는 있는데 닫는 `---` 가 없는 파일.
+ * gray-matter 는 이 경우 **예외 없이** 파일 전체를 frontmatter 로 보고 body='' 를
+ * 돌려주므로(감사 A3), 여기서 막지 않으면 빈 본문이 정상 파일로 고착된다.
+ */
+function hasClosingDelimiter(raw: string): boolean {
+  if (!/^---\r?\n/.test(raw)) return true; // frontmatter 가 없는 파일은 판정 대상 아님
+  return /\n---\s*(\r?\n|$)/.test(raw.slice(3));
+}
+
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * 원자적 파일 쓰기 — 같은 디렉터리의 임시 파일에 완전히 쓴 뒤 rename 으로 교체한다.
+ * rename 은 같은 볼륨 안에서 원자적이므로, 다른 프로세스나 크래시가
+ * "반쯤 쓰인 파일" 을 관측하는 창 자체가 사라진다(감사 A3/A8).
+ *
+ * 기존의 writeFileSync 직접 덮어쓰기는 닫는 `---` 앞에서 잘린 파일을 남길 수 있었고,
+ * 그런 파일은 gray-matter 가 예외 없이 body='' 로 읽어 다음 write 가 고착시켰다.
+ */
+function writeFileAtomic(fp: string, text: string): void {
+  const tmp = `${fp}.tmp-${process.pid}-${Date.now().toString(36)}`;
+  try {
+    fs.writeFileSync(tmp, text, "utf-8");
+    fs.renameSync(tmp, fp);
+  } catch (err) {
+    try {
+      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    } catch {
+      /* 임시 파일 정리 실패는 원 오류를 가리지 않도록 무시 */
+    }
+    throw err;
+  }
+}
+
+/**
  * 마크다운 볼트(Obsidian 호환)에 대한 저수준 파일 입출력.
  * vault/
  *   memories/  — 활성 기억 (*.md)
@@ -17,11 +67,14 @@ export class Vault {
   readonly root: string;
   readonly memoriesDir: string;
   readonly archiveDir: string;
+  /** 손상 파일 격리소 — 삭제하지 않고 여기로 옮긴다(원본 바이트 보존) */
+  readonly quarantineDir: string;
 
   constructor(root: string) {
     this.root = root;
     this.memoriesDir = path.join(root, "memories");
     this.archiveDir = path.join(root, "archive");
+    this.quarantineDir = path.join(root, "quarantine");
     fs.mkdirSync(this.memoriesDir, { recursive: true });
     fs.mkdirSync(this.archiveDir, { recursive: true });
   }
@@ -47,12 +100,58 @@ export class Vault {
     return fs.existsSync(this.filePath(slug)) || fs.existsSync(this.filePath(slug, true));
   }
 
+  /**
+   * 기억 1건 읽기. 손상 파일은 **예외를 던지지 않고** null 을 반환하고 격리한다 —
+   * 파일 1개의 손상이 서버 기동(regenerateIndex→loadAll)이나 전체 회상을
+   * 마비시키지 않도록(감사 A1). loadAll/resolve 는 이미 null 을 건너뛴다.
+   */
   read(slug: string, archived = false): MemoryRecord | null {
     const fp = this.filePath(slug, archived);
     if (!fs.existsSync(fp)) return null;
-    const raw = fs.readFileSync(fp, "utf-8");
-    const { data, content } = matter(raw);
-    return this.fromFrontmatter(slug, data, content.trim());
+
+    let raw: string;
+    try {
+      raw = fs.readFileSync(fp, "utf-8");
+    } catch (err) {
+      console.error(`[BigBrainMemory] 읽기 실패(건너뜀): ${slug} — ${errText(err)}`);
+      return null;
+    }
+
+    if (raw.trim() === "") {
+      this.quarantine(slug, archived, "빈 파일");
+      return null;
+    }
+    if (!hasClosingDelimiter(raw)) {
+      this.quarantine(slug, archived, "닫는 frontmatter 구분자(---) 없음 — 쓰기 중 절단 의심");
+      return null;
+    }
+
+    try {
+      const { data, content } = matter(raw, MATTER_OPTIONS);
+      return this.fromFrontmatter(slug, data, content.trim());
+    } catch (err) {
+      this.quarantine(slug, archived, `frontmatter 파싱 실패: ${errText(err)}`);
+      return null;
+    }
+  }
+
+  /**
+   * 손상 파일을 quarantine/ 으로 **이동**한다(삭제 아님, 원본 바이트 그대로).
+   * 격리에 실패해도 던지지 않는다 — 읽기 경로가 죽으면 A1 이 재발한다.
+   */
+  private quarantine(slug: string, archived: boolean, reason: string): void {
+    const from = this.filePath(slug, archived);
+    try {
+      fs.mkdirSync(this.quarantineDir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const to = path.join(this.quarantineDir, `${slug}.${stamp}.md`);
+      fs.renameSync(from, to);
+      console.error(`[BigBrainMemory] 손상 파일 격리: ${slug} — ${reason} → ${to}`);
+    } catch (err) {
+      console.error(
+        `[BigBrainMemory] 손상 파일 격리 실패(건너뜀): ${slug} — ${reason} / ${errText(err)}`,
+      );
+    }
   }
 
   /** slug를 memories/ → archive/ 순으로 찾는다 */
@@ -65,6 +164,11 @@ export class Vault {
   }
 
   write(record: MemoryRecord, archived = false): void {
+    writeFileAtomic(this.filePath(record.slug, archived), this.serialize(record));
+  }
+
+  /** 레코드를 frontmatter + 본문 마크다운 문자열로 직렬화 (slug 와 무관 — slug 는 파일명) */
+  private serialize(record: MemoryRecord): string {
     const fm: Record<string, unknown> = {
       id: record.id,
       title: record.title,
@@ -83,11 +187,100 @@ export class Vault {
       history: record.history,
     };
     if (record.source) fm.source = record.source;
+    if (record.project) fm.project = record.project;
     if (record.supersedes) fm.supersedes = record.supersedes;
     if (record.supersededBy) fm.superseded_by = record.supersededBy;
     if (record.archiveReason) fm.archive_reason = record.archiveReason;
-    const text = matter.stringify(`\n${record.body}\n`, fm);
-    fs.writeFileSync(this.filePath(record.slug, archived), text, "utf-8");
+    return matter.stringify(`\n${record.body}\n`, fm);
+  }
+
+  /**
+   * 신규 기억을 **원자적으로 생성**한다. 사용된 최종 slug 를 반환하고 record.slug 도 갱신한다.
+   *
+   * makeSlug 의 exists() 검사와 write 사이에는 유사기억 탐지를 위한 전체 볼트 재독이 끼어
+   * 창이 넓었고, write 가 배타 플래그 없는 writeFileSync 라 두 프로세스가 같은 제목을
+   * 동시에 remember 하면 같은 slug 를 배정받아 나중 write 가 앞 기억을 통째로 덮었다
+   * (감사 A5 — 양쪽 다 성공 응답을 받는데 파일은 1개, 패자는 무흔적 소실).
+   *
+   * flag:'wx' 는 "파일이 이미 있으면 실패" 를 OS 수준에서 보장하므로,
+   * EEXIST 면 다음 접미(-2, -3 …)로 재시도해 두 기억이 모두 살아남는다.
+   */
+  createNew(record: MemoryRecord): string {
+    const text = this.serialize(record); // 내용은 slug 와 무관하므로 한 번만 만든다
+    const base = record.slug;
+    for (let n = 1; n < 1000; n++) {
+      const slug = n === 1 ? base : `${base}-${n}`;
+      // archive/ 에 같은 이름이 있으면 망각된 기억이 되살아난 것처럼 보이므로 건너뛴다
+      if (fs.existsSync(this.filePath(slug, true))) continue;
+      if (this.tryCreateExclusive(this.filePath(slug, false), text)) {
+        record.slug = slug;
+        return slug;
+      }
+    }
+    throw new Error(`slug 확보 실패 (1000회 시도): ${base}`);
+  }
+
+  /**
+   * 대상 경로에 파일을 **원자적으로 생성**한다. 이미 있으면 false (덮어쓰지 않는다).
+   * 임시 파일에 내용을 다 쓴 뒤 linkSync 로 거는 이유: rename 은 대상을 덮어쓰므로
+   * 배타성을 잃고, 반대로 flag:'wx' 로 대상에 직접 쓰면 "빈 파일 → 내용" 사이의
+   * 창에 다른 프로세스가 읽어 절단 파일로 오인(격리)할 수 있다. link 는 대상이
+   * 이미 있으면 EEXIST 로 실패하므로 배타성과 내용 완전성을 동시에 만족한다.
+   */
+  private tryCreateExclusive(fp: string, text: string): boolean {
+    const tmp = `${fp}.tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    fs.writeFileSync(tmp, text, { encoding: "utf-8", flag: "wx" });
+    try {
+      fs.linkSync(tmp, fp);
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw err;
+    } finally {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        /* 임시 파일 정리 실패는 무시 */
+      }
+    }
+  }
+
+  /**
+   * revise 로 덮어쓰기 **전에** 현재 파일을 스냅샷으로 남긴다 (감사 A7).
+   *
+   * revise 는 본문을 즉시 덮어쓰고 history 에 reason 한 줄만 남겨서, AI 가 환각으로
+   * 옳은 기억을 "정정" 하면 원본 지식이 영구 소실됐다. 서버 instructions 가 중복 발견 시
+   * revise 를 권장하므로 파괴적 경로가 기본값이었다.
+   *
+   * 스냅샷은 archive/revisions/ 에 두되 slug 당 최근 N 세대만 유지한다.
+   * listSlugs 는 archive/ 를 재귀 탐색하지 않으므로 기억 목록에 섞이지 않는다.
+   */
+  snapshotRevision(slug: string, archived: boolean, keep = 3): void {
+    const from = this.filePath(slug, archived);
+    if (!fs.existsSync(from)) return;
+    try {
+      const dir = path.join(this.archiveDir, "revisions");
+      fs.mkdirSync(dir, { recursive: true });
+      // 같은 밀리초에 두 번 교정되면 파일명이 겹쳐 앞 세대를 덮어쓰므로 접미로 회피
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      let target = path.join(dir, `${slug}.${stamp}.md`);
+      for (let n = 2; fs.existsSync(target) && n < 100; n++) {
+        target = path.join(dir, `${slug}.${stamp}-${n}.md`);
+      }
+      fs.copyFileSync(from, target);
+
+      // 세대 상한 — 파일명의 타임스탬프가 사전순 = 시간순이라 정렬로 오래된 것부터 제거
+      const mine = fs
+        .readdirSync(dir)
+        .filter((f) => f.startsWith(`${slug}.`) && f.endsWith(".md"))
+        .sort();
+      for (const f of mine.slice(0, Math.max(0, mine.length - keep))) {
+        fs.unlinkSync(path.join(dir, f));
+      }
+    } catch (err) {
+      // 스냅샷 실패가 교정 자체를 막지는 않는다 — 경고만 남긴다
+      console.error(`[BigBrainMemory] 교정 전 스냅샷 실패(계속 진행): ${slug} — ${errText(err)}`);
+    }
   }
 
   /** 활성 기억을 archive/로 이동 */
@@ -97,8 +290,57 @@ export class Vault {
     if (fs.existsSync(from)) fs.renameSync(from, to);
   }
 
+  /**
+   * 인덱스는 **내용이 실제로 달라졌을 때만** 쓴다 (감사 B).
+   * 예전에는 본문에 생성 시각을 박아 내용이 같아도 매번 바이트가 달라졌고,
+   * 서버 기동 시마다 호출되므로 MCP 클라이언트를 켜기만 해도 diff 가 생겼다.
+   */
   writeIndex(markdown: string): void {
-    fs.writeFileSync(path.join(this.root, "MEMORY.md"), markdown, "utf-8");
+    const fp = path.join(this.root, "MEMORY.md");
+    try {
+      if (fs.existsSync(fp) && fs.readFileSync(fp, "utf-8") === markdown) {
+        this.markVault();
+        return;
+      }
+    } catch {
+      /* 비교 실패 시에는 그냥 쓴다 */
+    }
+    writeFileAtomic(fp, markdown);
+    this.markVault();
+  }
+
+  /**
+   * 이 디렉터리가 BigBrainMemory 볼트임을 표시한다 (감사 E3).
+   * 경로 오타로 엉뚱한 곳을 가리켜도 mkdirSync 가 조용히 빈 볼트를 만들어버려
+   * "기억 전무" 가 정상처럼 보였다. 마커가 있으면 "진짜 빈 볼트" 와
+   * "잘못된 경로에 새로 생긴 볼트" 를 구분할 수 있다.
+   */
+  private markVault(): void {
+    const marker = path.join(this.root, ".bigbrain-vault");
+    try {
+      if (!fs.existsSync(marker)) {
+        fs.writeFileSync(marker, `BigBrainMemory vault\ncreated: ${new Date().toISOString()}\n`, "utf-8");
+      }
+    } catch {
+      /* 마커는 진단용 편의 기능 — 실패해도 무시 */
+    }
+  }
+
+  /** 볼트 상태 진단 — 기동 로그와 경고에 쓴다 (E3) */
+  inspect(): { memories: number; archived: number; quarantined: number; hasMarker: boolean } {
+    const count = (dir: string) => {
+      try {
+        return fs.readdirSync(dir).filter((f) => f.endsWith(".md")).length;
+      } catch {
+        return 0;
+      }
+    };
+    return {
+      memories: count(this.memoriesDir),
+      archived: count(this.archiveDir),
+      quarantined: count(this.quarantineDir),
+      hasMarker: fs.existsSync(path.join(this.root, ".bigbrain-vault")),
+    };
   }
 
   /** 제목에서 Windows/Obsidian 호환 파일명 slug 생성 (한글 등 유니코드 유지) */
@@ -119,7 +361,16 @@ export class Vault {
   }
 
   private fromFrontmatter(slug: string, data: Record<string, unknown>, body: string): MemoryRecord {
-    const str = (v: unknown, dflt = ""): string => (typeof v === "string" ? v : dflt);
+    // js-yaml 은 **인용부호 없는** 타임스탬프(created: 2025-01-01, 또는 ISO 형태)를
+    // Date 인스턴스로 파싱한다. Obsidian 이나 손편집에서 흔한 형태인데,
+    // 문자열만 통과시키면 created/updated/lastAccessed/lastReinforced 가 전부
+    // 기본값(=지금)으로 리셋돼 오래된 기억의 기저활성이 부풀고(실측 −2.96 → +3.84),
+    // 다음 write 가 그 잘못된 값을 고착시켰다(감사 A6).
+    const str = (v: unknown, dflt = ""): string => {
+      if (typeof v === "string") return v;
+      if (v instanceof Date && !Number.isNaN(v.getTime())) return v.toISOString();
+      return dflt;
+    };
     const num = (v: unknown, dflt: number): number => (typeof v === "number" && Number.isFinite(v) ? v : dflt);
     const arr = (v: unknown): string[] => (Array.isArray(v) ? v.map(String) : []);
     const type = VALID_TYPES.includes(data.type as MemoryType) ? (data.type as MemoryType) : "semantic";
@@ -143,6 +394,8 @@ export class Vault {
       lastReinforced: str(data.last_reinforced, created),
       accessCount: num(data.access_count, 0),
       source: str(data.source) || undefined,
+      // 구버전 노트에는 없는 필드 — 없으면 전역 기억으로 취급한다(하위 호환)
+      project: str(data.project) || undefined,
       links: arr(data.links),
       supersedes: str(data.supersedes) || undefined,
       supersededBy: str(data.superseded_by) || undefined,

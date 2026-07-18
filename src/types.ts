@@ -33,6 +33,12 @@ export interface MemoryRecord {
   accessCount: number;
   /** 출처 — 인간의 출처혼동(source-monitoring error)을 역보완 (리포트 P8) */
   source?: string;
+  /**
+   * 소속 프로젝트. 없으면(undefined) **전역 기억** — 어느 프로젝트에서도 회상된다.
+   * 네이티브 메모리는 프로젝트별로 저장소가 갈려 교차 프로젝트 지식을 공유할 수 없는데,
+   * 이 필드는 격리(프로젝트 기억)와 공유(전역 기억)를 한 볼트에서 양립시킨다.
+   */
+  project?: string;
   /** 연결된 기억의 slug 목록 (연상 네트워크) */
   links: string[];
   supersedes?: string;
@@ -53,6 +59,7 @@ export interface RememberInput {
   links?: string[];
   confidence?: number;
   source?: string;
+  project?: string;
   supersedes?: string;
 }
 
@@ -63,7 +70,14 @@ export interface ReviseInput {
   tags?: string[];
   confidence?: number;
   source?: string;
+  project?: string;
   reason: string;
+}
+
+export interface SearchOutcome {
+  results: SearchResult[];
+  /** 컷오프 전 직접 매칭 총 건수 — 에이전트가 누락 존재를 알 수 있게 (감사 D5) */
+  totalMatched: number;
 }
 
 export interface SearchResult {
