@@ -18,9 +18,10 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "node scripts/smoke-test.mjs && node scripts/regress-mcp-config.mjs",
+    "test": "node scripts/smoke-test.mjs && node scripts/regress-mcp-config.mjs && node scripts/regress-corruption.mjs",
     "test:smoke": "node scripts/smoke-test.mjs",
     "test:config": "node scripts/regress-mcp-config.mjs",
+    "test:corruption": "node scripts/regress-corruption.mjs",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {

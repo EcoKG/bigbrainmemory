@@ -43,7 +43,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
 
 ## Phase P0 — 데이터 안전 (대체 선언의 전제)
 
-- [ ] **T1. 손상 파일 파싱 격리** (A1 + A2)
+- [x] **T1. 손상 파일 파싱 격리** (A1 + A2) — 완료 2026-07-18
   - 무엇: 깨진 frontmatter 1개가 서버 부팅을 막고(process.exit), 재접근 시 gray-matter 캐시가 기본값 레코드로 세탁해 메타데이터를 덮어쓴다.
   - 왜: critical — 단일 파일 손상 = 전체 기억 접근 불능 + 조용한 메타데이터 파괴. 둘 다 재현 확정.
   - 어떻게: ① `Vault.read`(vault.ts:53-55) 를 try/catch — 실패 시 stderr 경고 + null 반환 (loadAll 은 이미 null 스킵) ② 손상 파일은 `vault/quarantine/` 으로 이동 ③ `main()`(index.ts:261) 의 regenerateIndex 도 try/catch ④ `fromFrontmatter` 가 id 부재 시 손상 간주 null ⑤ 파싱 유래 불확실 레코드는 write 금지 (캐시 세탁 차단).
@@ -163,4 +163,5 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
 |---|---|---|
 | 2026-07-18 | 감사 완료 (47건 확정) + 본 계획 수립 | docs/native-parity-audit.md |
 | 2026-07-18 | 네이티브 5건 이관 + 브리지 전환 (SimpleMailServer) | 대체 전략 ④ 실증 |
+| 2026-07-18 | **T1** 손상 파일 파싱 격리 | `Vault.read` 가 예외 대신 null 반환 + `quarantine/` 이동(원본 바이트 보존), 빈 파일·절단 파일 사전 감지, `main()` regenerateIndex try/catch. **계획 대비 변경 2건**: ④ "id 부재 시 손상 간주"는 **미채택** — gray-matter 에 옵션 객체를 넘겨 캐시 경로 자체를 차단(A2 세탁 벡터가 구조적으로 소멸)했고, id 부재 판정은 frontmatter 없는 손수 작성 Obsidian 노트를 격리해버려 Obsidian 호환을 해친다(회귀 테스트 5번이 이를 방어). ⑤ "불확실 레코드 write 금지"는 read 가 null 을 반환하게 되어 자동 해소. 회귀 `scripts/regress-corruption.mjs` 21건 신설 — 전체 59✔/0✘ |
 | 2026-07-18 | **T0** .mcp.json 죽은 경로 수정 | `D:/BigBrainMemory/dist/index.js` → `./dist/index.js`, `env.BIGBRAIN_VAULT` 제거(기본값 `<repo>/vault` 위임). 회귀 테스트 `scripts/regress-mcp-config.mjs` 신설 + `npm test` 에 편입 — 스모크 22 + 설정 11 전부 통과. 라이브 볼트 무변형(19건 유지) 확인. ※ 검증란의 "Claude Code 재시작 → /mcp 확인"은 세션 내 불가라 **동일 스폰 계약(cwd=저장소 루트, 같은 command/args)을 프로그램으로 재현**해 8개 도구 등록까지 확인하는 방식으로 대체함 — 사용자가 이 레포를 프로젝트로 열 때 최종 육안 확인 필요 |

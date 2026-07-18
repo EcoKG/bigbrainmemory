@@ -258,7 +258,16 @@ server.registerTool(
 );
 
 async function main() {
-  store.regenerateIndex();
+  // 인덱스 재생성 실패가 서버 기동을 막아서는 안 된다(감사 A1: 손상 파일 1개로
+  // process.exit(1) → 8개 도구 전부 사용 불능). MEMORY.md 는 파생 파일이고
+  // 기억 조회 자체는 인덱스 없이도 동작한다.
+  try {
+    store.regenerateIndex();
+  } catch (err) {
+    console.error(
+      `[BigBrainMemory] 인덱스 재생성 실패(계속 진행): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // stdout은 MCP 프로토콜 전용 — 로그는 반드시 stderr로
