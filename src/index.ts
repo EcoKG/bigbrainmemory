@@ -42,8 +42,11 @@ const MEMORY_TYPE = z
     "Memory type: episodic (events/experiences), semantic (facts/knowledge), procedural (how-to/workflows), preference (user tastes/style)",
   );
 
-/** instructions 에 실을 기억 인덱스 최대 건수 (컨텍스트 예산 보호) */
-const INDEX_LIMIT = Number(process.env.BIGBRAIN_INDEX_LIMIT) || 40;
+/** instructions 에 실을 기억 인덱스 최대 건수 (컨텍스트 예산 보호). 0 이면 인덱스 생략 */
+const INDEX_LIMIT = (() => {
+  const v = Number(process.env.BIGBRAIN_INDEX_LIMIT);
+  return Number.isFinite(v) && v >= 0 ? v : 40;
+})();
 
 /**
  * 이 서버 인스턴스의 기본 프로젝트 스코프 (감사 E2).
@@ -85,6 +88,7 @@ function memoryIndexLines(): string[] {
         `When storing, set \`project: "${DEFAULT_PROJECT}"\` for facts that only apply here; omit \`project\` for knowledge that should follow the user everywhere (preferences, general workflows).`,
       ]
     : [];
+  if (INDEX_LIMIT === 0) return scope; // 인덱스 생략 (스코프 안내는 유지)
   const shown = items.slice(0, INDEX_LIMIT);
   const head =
     items.length > shown.length
@@ -113,13 +117,45 @@ const server = new McpServer(
       "5. REFLECT — periodically call `reflect` to find weakened, low-confidence, or duplicate memories and clean them up (forget candidates are surfaced, never auto-deleted).",
       "Two independent dimensions (do not conflate them): `confidence` = how likely the memory is TRUE (change only via `revise`); recall accessibility = base-level activation from frequency+recency, computed automatically. A rarely-recalled memory can still be highly trusted, and vice versa.",
       "Record a `source` when you know where a fact came from — it prevents source confusion later. Memories are stored verbatim and never auto-merged; consolidate only via explicit `revise`.",
+      "Every result carries `age_days` (days since last update). A memory is a point-in-time observation, not live state: when it cites code, file paths, versions or config and `stale_hint` is present, verify against the current source before asserting it as fact — and `revise` it when reality has moved on.",
       ...memoryIndexLines(),
     ].join("\n"),
   },
 );
 
+/** 이 일수 이상 갱신되지 않은 기억에 낡음 경고를 붙인다 (0 이면 항상 경고) */
+const STALE_DAYS = (() => {
+  const v = Number(process.env.BIGBRAIN_STALE_DAYS);
+  return Number.isFinite(v) && v >= 0 ? v : 30;
+})();
+
+/**
+ * 기억의 나이를 응답에 실어준다 (감사 E4).
+ *
+ * recall 결과에는 시간 정보가 하나도 없어서, 120일 방치된 기억도 아무 표시 없이
+ * 등장했다. confidence 는 "얼마나 참인가" 축이라 시간 경과를 표현하지 못하므로
+ * 보완재가 되지 못한다. 감쇠는 순위만 낮출 뿐 나이를 전달하지 않는다.
+ * 그 결과 모델이 반년 전 코드 구조 기억을 최신 사실로 인용할 수 있었다 —
+ * 네이티브 메모리가 Read 시 자동으로 붙여주는 "N days old" 리마인더에 해당하는 것이 없었다.
+ */
+function ageInfo(m: MemoryRecord): Record<string, unknown> {
+  const ms = Date.now() - Date.parse(m.updated);
+  if (!Number.isFinite(ms)) return {};
+  const ageDays = Math.max(0, Math.floor(ms / 86_400_000));
+  return {
+    updated: m.updated,
+    age_days: ageDays,
+    ...(ageDays >= STALE_DAYS
+      ? {
+          stale_hint: `이 기억은 ${ageDays}일 전에 갱신됐습니다 — 현재 코드/사실과 대조한 뒤 사용하고, 달라졌으면 revise 로 교정하세요.`,
+        }
+      : {}),
+  };
+}
+
 function brief(m: MemoryRecord): Record<string, unknown> {
   return {
+    ...ageInfo(m),
     id: m.id,
     slug: m.slug,
     title: m.title,

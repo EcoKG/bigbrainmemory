@@ -99,7 +99,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
   - 어떻게: ① 기동 로그에 `memories=<수>` 출력 ② writeIndex 시 `.bigbrain-vault` 마커 생성 ③ BIGBRAIN_VAULT 명시됐는데 마커도 기억도 없으면 stderr 경고 + instructions 첫 줄에 동일 경고 부착 (모델에게도 보이게).
   - 검증: 오타 경로 기동 → 경고 출력 + instructions 에 경고 포함 확인.
 
-- [ ] **T10. staleness 노출** (E4)
+- [x] **T10. staleness 노출** (E4) — 완료 2026-07-18
   - 무엇: recall 결과에 시간 정보가 0개 — 120일 방치 기억이 아무 표시 없이 등장한다 (실측).
   - 왜: high — 모델이 낡은 코드 구조 기억을 최신으로 인용하는, 가장 조용히 사고 내는 격차. 네이티브의 "N days old" 리마인더 재현.
   - 어떻게: index.ts `brief()` 에 `age_days = floor((now − updated)/86400000)` + `stale_hint` (기본 30일 이상, `BIGBRAIN_STALE_DAYS` env). brief 를 searchHit/full 이 공유하므로 recall/read/list 일괄 반영.
@@ -163,6 +163,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
 |---|---|---|
 | 2026-07-18 | 감사 완료 (47건 확정) + 본 계획 수립 | docs/native-parity-audit.md |
 | 2026-07-18 | 네이티브 5건 이관 + 브리지 전환 (SimpleMailServer) | 대체 전략 ④ 실증 |
+| 2026-07-18 | **T10** staleness 노출 | `ageInfo()` 가 `updated`/`age_days`/`stale_hint`(기본 30일, `BIGBRAIN_STALE_DAYS`) 를 `brief()` 에 주입 → recall·read_memory·list_memories 일괄 반영. instructions 에 "기억은 시점 관측이지 현재 상태가 아니다 — 코드/경로/버전 인용 시 대조 후 사용" 지침 추가. **버그 하나 잡음**: `Number(env) \|\| 기본값` 이 `0` 을 falsy 로 먹어 임계 0 설정이 무시됐다 — 저장소가 `SPACING_WINDOW_MS` 에서 쓰는 관용구로 통일(`INDEX_LIMIT` 도 동일 수정, 0 이면 인덱스 생략). 회귀 `scripts/regress-staleness.mjs` 신설(17건) — 전체 185✔/0✘ |
 | 2026-07-18 | **T9** 실패의 가시화 | 기동 로그에 `memories=N archived=N quarantined=N(!) project=X`, `.bigbrain-vault` 마커(`writeIndex` 시 생성), `vault.inspect()` 진단. BIGBRAIN_VAULT 가 지정됐는데 기억 0 + 마커 없음이면 stderr **와 instructions 첫머리** 양쪽에 경고("중복 저장 금지"). 격리 파일 존재 시 별도 알림. **버그 하나 잡음**: `regenerateIndex`→`writeIndex`→`markVault` 가 main 의 경고 판정보다 먼저 실행돼 stderr 경고가 사라졌다 — 기동 시점에 한 번만 계산(`VAULT_WARNING` 상수)해 두 채널을 일치시킴. 회귀 4~7절 추가(오타 경로/정상 볼트 오경보/마커 있는 빈 볼트/격리 알림) — 전체 168✔/0✘ |
 | 2026-07-18 | **T8** 프로젝트 스코핑 | `project?: string` 필드 + `inScope()` 필터(`!m.project \|\| m.project === scope`) 를 search·연상확산·list 에 적용, remember/recall/list/revise 스키마에 노출, `BIGBRAIN_PROJECT` 서버 기본값. **계획 대비 판단**: remember 에서 `project` 생략 시 서버 스코프를 **몰래 씌우지 않음** — 씌우면 "전역이면 생략" 이라는 도구 설명과 모순되고 사용자 선호 같은 범용 지식이 한 프로젝트에 갇혀 조용히 회상되지 않는다. 대신 instructions 에 현재 스코프와 저장 지침을 실어 모델이 명시적으로 판단하게 함. 회귀 `scripts/regress-scoping.mjs` 신설(24건, 구버전 노트 하위 호환·연상 누수 차단·MCP 계층 포함) — 전체 155✔/0✘ |
 | 2026-07-18 | **T7** 회상 트리거 삼중화 | ① `memoryIndexLines()` 가 기동 시 기억 인덱스(제목+설명+타입)를 instructions 에 부착, `BIGBRAIN_INDEX_LIMIT`(기본 40) 상한·총건수 안내·빈 볼트 명시. ② **사용자 승인 후** `~/.claude/settings.json` 에 SessionStart 훅 추가 — `vault/MEMORY.md` 를 `<bigbrainmemory-index>` 태그로 감싸 주입(`head -c 8000` 상한). 기존 Orca 훅 10종 무변경, 백업 `settings.json.bak-bbm-20260718`. 실제 실행해 3,224자 출력 확인. ③ README 에 3중 채널 문서화 + 죽은 `D:/` 경로 정리. 회귀 `scripts/regress-trigger.mjs` 신설(12건, `client.getInstructions()` 로 실제 스폰 검증) — 전체 131✔/0✘ |
