@@ -285,6 +285,10 @@ export class MemoryStore {
     if (!found) return null;
     const m = found.record;
     const contentChanged = input.content !== undefined && input.content.trim() !== m.body;
+    // 되돌릴 수 없는 덮어쓰기를 막는다 — 내용이 실제로 바뀔 때만 구본을 남긴다 (A7)
+    if (contentChanged) {
+      this.vault.snapshotRevision(m.slug, found.archived);
+    }
     if (input.title !== undefined) m.title = input.title;
     if (input.description !== undefined) m.description = input.description;
     if (input.content !== undefined) m.body = input.content.trim();

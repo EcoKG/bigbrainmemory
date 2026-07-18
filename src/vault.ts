@@ -244,6 +244,44 @@ export class Vault {
     }
   }
 
+  /**
+   * revise 로 덮어쓰기 **전에** 현재 파일을 스냅샷으로 남긴다 (감사 A7).
+   *
+   * revise 는 본문을 즉시 덮어쓰고 history 에 reason 한 줄만 남겨서, AI 가 환각으로
+   * 옳은 기억을 "정정" 하면 원본 지식이 영구 소실됐다. 서버 instructions 가 중복 발견 시
+   * revise 를 권장하므로 파괴적 경로가 기본값이었다.
+   *
+   * 스냅샷은 archive/revisions/ 에 두되 slug 당 최근 N 세대만 유지한다.
+   * listSlugs 는 archive/ 를 재귀 탐색하지 않으므로 기억 목록에 섞이지 않는다.
+   */
+  snapshotRevision(slug: string, archived: boolean, keep = 3): void {
+    const from = this.filePath(slug, archived);
+    if (!fs.existsSync(from)) return;
+    try {
+      const dir = path.join(this.archiveDir, "revisions");
+      fs.mkdirSync(dir, { recursive: true });
+      // 같은 밀리초에 두 번 교정되면 파일명이 겹쳐 앞 세대를 덮어쓰므로 접미로 회피
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      let target = path.join(dir, `${slug}.${stamp}.md`);
+      for (let n = 2; fs.existsSync(target) && n < 100; n++) {
+        target = path.join(dir, `${slug}.${stamp}-${n}.md`);
+      }
+      fs.copyFileSync(from, target);
+
+      // 세대 상한 — 파일명의 타임스탬프가 사전순 = 시간순이라 정렬로 오래된 것부터 제거
+      const mine = fs
+        .readdirSync(dir)
+        .filter((f) => f.startsWith(`${slug}.`) && f.endsWith(".md"))
+        .sort();
+      for (const f of mine.slice(0, Math.max(0, mine.length - keep))) {
+        fs.unlinkSync(path.join(dir, f));
+      }
+    } catch (err) {
+      // 스냅샷 실패가 교정 자체를 막지는 않는다 — 경고만 남긴다
+      console.error(`[BigBrainMemory] 교정 전 스냅샷 실패(계속 진행): ${slug} — ${errText(err)}`);
+    }
+  }
+
   /** 활성 기억을 archive/로 이동 */
   moveToArchive(slug: string): void {
     const from = this.filePath(slug, false);

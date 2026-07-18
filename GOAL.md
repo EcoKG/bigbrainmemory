@@ -73,7 +73,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
   - 어떻게: `str()`(vault.ts:122) 이 `v instanceof Date → v.toISOString()` 허용. (대안: yaml JSON_SCHEMA 파싱)
   - 검증: 비인용 날짜(`2025-01-01` / ISO) 노트 read → created 보존 확인.
 
-- [ ] **T6. revise 구본 스냅샷** (A7)
+- [x] **T6. revise 구본 스냅샷** (A7) — 완료 2026-07-18
   - 무엇: revise 가 body 를 즉시 덮어쓰고 reason 한 줄만 남긴다 — undo 불가. instructions 가 revise 를 권장해 파괴 경로가 기본이다.
   - 왜: medium — AI 환각 revise 한 번이 원본 지식을 영구 소실시킨다.
   - 어떻게: 덮어쓰기 전 원본 파일을 `vault/archive/revisions/<slug>.<updated-ts>.md` 로 복사, slug 당 최근 3세대 보존(초과분 삭제). README 에 볼트 git 관리 권고 1줄.
@@ -163,6 +163,8 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
 |---|---|---|
 | 2026-07-18 | 감사 완료 (47건 확정) + 본 계획 수립 | docs/native-parity-audit.md |
 | 2026-07-18 | 네이티브 5건 이관 + 브리지 전환 (SimpleMailServer) | 대체 전략 ④ 실증 |
+| 2026-07-18 | **P0 완료** — 데이터 안전 6/6 | T1~T6 전부 통과. 회귀 테스트 4종 118✔/0✘ 로 감사 재현 시나리오 고정 |
+| 2026-07-18 | **T6** revise 구본 스냅샷 | `vault.snapshotRevision()` — 덮어쓰기 전 `archive/revisions/<slug>.<ts>.md` 로 복사, slug 당 최근 3세대 유지(사전순=시간순 정렬로 만료). **내용이 실제로 바뀔 때만** 스냅샷(재확인 revise 는 낭비 안 함). 같은 밀리초 충돌 시 접미로 회피. 스냅샷 실패는 교정을 막지 않음(경고만). `listSlugs` 가 archive 를 재귀 탐색하지 않아 기억 목록·검색·reflect 에 안 섞임을 테스트로 고정. README 에 볼트 git 백업 권고 + 디렉터리 구조 갱신. 회귀 3·4절 추가 — 전체 118✔/0✘ |
 | 2026-07-18 | **T5** YAML Date 허용 | `str()` 가 `Date` 인스턴스를 `toISOString()` 으로 수용(Invalid Date 는 기본값). 회귀 `scripts/regress-obsidian-edit.mjs` 신설(1·2절) — 인용 없는 `created: 2025-01-01T…`·날짜만 형식 `2025-02-02` 모두 보존, 기저활성 부풀림 없음, write-back 후에도 고착 안 됨, 기존 형식 왕복 무손실. 전체 105✔/0✘ |
 | 2026-07-18 | **T4** remember 원자적 생성 | `vault.createNew()` 신설 — 직렬화를 `serialize()` 로 분리하고, 임시 파일에 내용을 다 쓴 뒤 `linkSync` 로 거는 방식(대상 존재 시 EEXIST)으로 **배타성과 내용 완전성을 동시에** 확보. `flag:'wx'` 직접 쓰기는 "빈 파일→내용" 창에 다른 프로세스가 절단으로 오인·격리할 수 있어 채택하지 않음. **추가 발견·수정**: supersede 블록이 최종 slug 확정 **전에** `supersededBy` 를 기록해, 충돌로 `-2` 가 붙으면 존재하지 않는 파일을 가리켰다 — 순서를 분리(신규 쪽 표시는 생성 전, 구 기억 역참조는 생성 후). 회귀 5·6절 추가 — 전체 97✔/0✘ |
 | 2026-07-18 | **T3** reinforce 재읽기+증분 | 스냅샷 재직렬화 → 쓰기 직전 `vault.find` 재읽기 후 델타만 적용. 파일이 사라졌으면 write 생략(부활 방지), archive 로 이동했으면 그쪽에 기록. 강화를 **best-effort** 로 전환(쓰기 실패해도 회상은 계속 — T2 발견 사항 해소). 무의미해진 `opts.archived` 파라미터 제거. 회귀 `scripts/regress-concurrency.mjs` 신설(4절) — **강화 소실률 84~99.5% → 0.0%** (2프로세스×300회, 기대 602/실측 602), revise·forget 경쟁 보존 확인. 전체 83✔/0✘ |
