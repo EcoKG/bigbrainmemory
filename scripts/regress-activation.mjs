@@ -103,10 +103,13 @@ console.log("3) reflect 오분류 해소");
   shape(dir, "어제-쓴-기억", { agoHours: YEAR_H, strength: 6, reinforcedAgoHours: 20 });
   shape(dir, "진짜-방치-기억", { agoHours: YEAR_H, strength: 6, reinforcedAgoHours: YEAR_H });
 
-  const rep = new MemoryStore(new Vault(dir)).reflect();
-  const weak = rep.weakened.map((w) => w.slug);
+  const s2 = new MemoryStore(new Vault(dir));
+  const weak = s2.reflect().weakened.map((w) => w.slug);
   check("어제 쓴 기억은 weakened 아님", !weak.includes("어제-쓴-기억"), weak.join(","));
-  check("진짜 방치 기억은 weakened", weak.includes("진짜-방치-기억"), weak.join(","));
+  // 분류기 자체(방치 기억 탐지)는 8절에서 실볼트 크기로 검증한다 —
+  // 여기서는 C1 고유 성질만 본다: 최근성이 활성 순서를 만든다.
+  const acts = Object.fromEntries(s2.search("폭스트롯").concat(s2.search("골프")).map((r) => [r.record.slug, r.activation]));
+  check("어제 쓴 기억의 활성이 방치 기억보다 높음", acts["어제-쓴-기억"] > acts["진짜-방치-기억"], JSON.stringify(acts));
 }
 
 // ── 4. P4 '바람직한 어려움' 보너스가 최근 강화 기억에는 안 붙는다 (C4 자동 해소)
@@ -156,10 +159,70 @@ console.log("6) 강화 → 활성 상승");
   check("강화 직후 활성이 상승", after > before, `${before} → ${after}`);
 }
 
+// ── 7. 신생 볼트가 통째로 weakened 로 뜨지 않는다 (T13/C2)
+console.log("7) 신생 볼트 weakened 노이즈 해소 (C2)");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  for (let i = 0; i < 3; i++) s.remember({ title: `신생 기억 ${i}`, content: `리마 ${i} 본문.`, type: "semantic" });
+  // 감사 재현 조건: 저장만 하고 17h / 24h / 3일 지난 상태
+  shape(dir, "신생-기억-0", { agoHours: 17, strength: 1, reinforcedAgoHours: 17 });
+  shape(dir, "신생-기억-1", { agoHours: 24, strength: 1, reinforcedAgoHours: 24 });
+  shape(dir, "신생-기억-2", { agoHours: 72, strength: 1, reinforcedAgoHours: 72 });
+
+  const rep = new MemoryStore(new Vault(dir)).reflect();
+  check("종전 3/3 전원 등재 → 이제 0건", rep.weakened.length === 0, rep.weakened.map((w) => w.slug).join(","));
+  check("망각 후보도 0건", rep.forgetCandidates.length === 0);
+  check("카운트는 정상 집계", rep.counts.total === 3);
+}
+
+// ── 8. 진짜 방치된 기억은 여전히 잡는다 (기능 보존)
+console.log("8) 장기 방치는 계속 탐지");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  for (let i = 0; i < 10; i++) s.remember({ title: `마이크 기억 ${i}`, content: `마이크 ${i} 본문.`, type: "semantic" });
+  // 8건은 최근 강화, 2건만 1년 방치
+  for (let i = 0; i < 8; i++) shape(dir, `마이크-기억-${i}`, { agoHours: YEAR_H, strength: 4, reinforcedAgoHours: 2 });
+  shape(dir, "마이크-기억-8", { agoHours: YEAR_H, strength: 1, reinforcedAgoHours: YEAR_H });
+  shape(dir, "마이크-기억-9", { agoHours: YEAR_H, strength: 1, reinforcedAgoHours: YEAR_H });
+
+  const rep = new MemoryStore(new Vault(dir)).reflect();
+  const weak = rep.weakened.map((w) => w.slug);
+  check("방치된 2건이 weakened 로 잡힘", weak.includes("마이크-기억-8") && weak.includes("마이크-기억-9"), weak.join(","));
+  check("최근 쓰는 8건은 제외", !weak.some((w) => /마이크-기억-[0-7]$/.test(w)), weak.join(","));
+  check("하위 20% 상한(=2건) 준수", rep.weakened.length <= 2, `len=${rep.weakened.length}`);
+  check("활성 낮은 순 정렬", rep.weakened.every((w, i, a) => i === 0 || a[i - 1].activation <= w.activation));
+}
+
+// ── 9. 유예기간·분위 환경변수
+console.log("9) 임계 환경변수 조정");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  for (let i = 0; i < 5; i++) s.remember({ title: `노벰버 ${i}`, content: `노벰버 ${i} 본문.`, type: "semantic" });
+  for (let i = 0; i < 5; i++) shape(dir, `노벰버-${i}`, { agoHours: 20, strength: 1, reinforcedAgoHours: 20 });
+
+  const prevG = process.env.BIGBRAIN_WEAKENED_GRACE_H;
+  const prevR = process.env.BIGBRAIN_WEAKENED_RATIO;
+  try {
+    process.env.BIGBRAIN_WEAKENED_GRACE_H = "0";
+    process.env.BIGBRAIN_WEAKENED_RATIO = "1";
+    const { MemoryStore: Fresh } = await import(`${distUrl("store.js")}?t13=1`);
+    const rep = new Fresh(new Vault(dir)).reflect();
+    check("유예 0 + 분위 1 이면 종전처럼 전원 등재", rep.weakened.length === 5, `len=${rep.weakened.length}`);
+  } finally {
+    if (prevG === undefined) delete process.env.BIGBRAIN_WEAKENED_GRACE_H;
+    else process.env.BIGBRAIN_WEAKENED_GRACE_H = prevG;
+    if (prevR === undefined) delete process.env.BIGBRAIN_WEAKENED_RATIO;
+    else process.env.BIGBRAIN_WEAKENED_RATIO = prevR;
+  }
+}
+
 for (const d of cleanups) fs.rmSync(d, { recursive: true, force: true });
 
 if (failures > 0) {
   console.error(`\n실패: ${failures}건`);
   process.exit(1);
 }
-console.log("\nT12 기저활성 최근성 회귀 테스트 통과 ✔");
+console.log("\nT12/T13 활성·임계 회귀 테스트 통과 ✔");

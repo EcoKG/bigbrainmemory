@@ -42,6 +42,16 @@ const HARD_RETRIEVAL_ACTIVATION = 0.5 - Math.log(1 / (1 - 0.5)); // ≈ -0.193
  * 접근수 통계를 정확히 원하면 BIGBRAIN_FLUSH_EVERY_ACCESS=1 로 켠다.
  */
 const FLUSH_EVERY_ACCESS = /^(1|true|yes)$/i.test(process.env.BIGBRAIN_FLUSH_EVERY_ACCESS ?? "");
+/** reflect 의 weakened 유예기간 — 이보다 어린 기억은 "약해졌다" 고 보지 않는다 (P6, 감사 C2) */
+const WEAKENED_GRACE_MS = (() => {
+  const v = Number(process.env.BIGBRAIN_WEAKENED_GRACE_H);
+  return (Number.isFinite(v) && v >= 0 ? v : 72) * HOUR_MS; // 기본 72시간
+})();
+/** weakened 로 제시할 상한 비율 — 활성 하위 이만큼만 (0 이면 기능 끄기) */
+const WEAKENED_RATIO = (() => {
+  const v = Number(process.env.BIGBRAIN_WEAKENED_RATIO);
+  return Number.isFinite(v) && v >= 0 && v <= 1 ? v : 0.2; // 기본 하위 20%
+})();
 // -----------------------------------------------------------------------
 
 function nowIso(): string {
@@ -420,19 +430,32 @@ export class MemoryStore {
     const now = Date.now();
     const active = all.filter((m) => m.status === "active");
 
-    // 기저활성이 임계 τ 미만 = 오래 안 쓰여 약해진(회상 곤란) 기억
+    // 기저활성이 임계 τ 미만 = 오래 안 쓰여 약해진(회상 곤란) 기억.
+    //
+    // 절대 임계만으로는 신생 볼트에서 전원이 걸린다(감사 C2): n=1 기억은 생성 16.2시간이면
+    // τ 를 밑돌아, 저장만 하고 하루 지난 멀쩡한 기억이 전부 "정리 대상" 으로 뜬다.
+    // instructions 가 주기적 reflect 후 정리를 지시하므로 오탐이 실제 삭제로 이어질 수 있다.
+    // 두 겹으로 완화한다:
+    //   (a) 유예기간 — 갓 만든 기억은 아직 "잊혔다" 고 볼 수 없다
+    //   (b) 상대 분위 — 볼트에서 상대적으로 가장 약한 것만 고른다. 볼트가 작으면
+    //       정리할 것도 없으므로 자연히 0건이 된다(절대 임계만 쓰던 종전의 노이즈 제거)
     const withAct = active.map((m) => ({
       m,
       act: activationOf(m, now),
+      matured: now - Date.parse(m.created) >= WEAKENED_GRACE_MS,
     }));
-    const weakened = withAct
-      .filter((x) => x.act < RETRIEVAL_THRESHOLD)
-      .sort((a, b) => a.act - b.act)
-      .map((x) => ({ slug: x.m.slug, title: x.m.title, activation: Number(x.act.toFixed(2)), confidence: x.m.confidence }));
-    // 망각 후보 = 약해졌고(활성 낮음) + 확신도도 낮음 (적응적 망각 후보, 실제 삭제는 AI 판단)
-    const forgetCandidates = withAct
-      .filter((x) => x.act < RETRIEVAL_THRESHOLD && x.m.confidence < 0.5)
-      .map((x) => ({ slug: x.m.slug, title: x.m.title, activation: Number(x.act.toFixed(2)), confidence: x.m.confidence }));
+    const brief = (x: (typeof withAct)[number]) => ({
+      slug: x.m.slug,
+      title: x.m.title,
+      activation: Number(x.act.toFixed(2)),
+      confidence: x.m.confidence,
+    });
+    const faded = withAct.filter((x) => x.matured && x.act < RETRIEVAL_THRESHOLD).sort((a, b) => a.act - b.act);
+    const cap = Math.floor(active.length * WEAKENED_RATIO);
+    const weakened = faded.slice(0, cap).map(brief);
+    // 망각 후보 = 약해졌고(활성 낮음) + 확신도도 낮음 (적응적 망각 후보, 실제 삭제는 AI 판단).
+    // 확신도 게이트가 이미 강력한 필터라 분위 상한은 걸지 않되, 유예기간은 동일하게 적용한다.
+    const forgetCandidates = faded.filter((x) => x.m.confidence < 0.5).map(brief);
 
     const lowConfidence = active.filter((m) => m.confidence < 0.4);
     const duplicates: [string, string][] = [];
