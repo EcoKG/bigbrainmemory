@@ -256,11 +256,7 @@ export class MemoryStore {
     const direct = new Set(results.filter((r) => !r.snippet.startsWith("(연상")).map((r) => r.record.slug));
     for (const r of results) {
       const isDirect = direct.has(r.record.slug);
-      this.reinforce(r.record, {
-        active: isDirect,
-        archived: r.record.status === "archived",
-        preActivation: r.activation,
-      });
+      this.reinforce(r.record, { active: isDirect, preActivation: r.activation });
     }
     return results;
   }
@@ -270,7 +266,7 @@ export class MemoryStore {
     const found = this.resolve(idOrSlug);
     if (!found) return null;
     const act = baseLevelActivation(found.record.storageStrength, Date.now() - Date.parse(found.record.created));
-    this.reinforce(found.record, { active: false, archived: found.archived, preActivation: act });
+    this.reinforce(found.record, { active: false, preActivation: act });
     return found.record;
   }
 
@@ -419,21 +415,57 @@ export class MemoryStore {
   /**
    * 강화 (P3 간격 게이트 + P4 능동>수동 + 바람직한 어려움).
    * 저장강도는 간격이 지나야 오른다. 원문 접근수/최근성은 항상 갱신.
+   *
+   * **디스크 반영은 스냅샷이 아니라 재읽기 후 증분으로 한다(감사 A4).**
+   * search() 는 시작 시 loadAll 로 전체 스냅샷을 뜨고 끝에서 강화를 기록하는데,
+   * 그 창(볼트 스캔 1회 길이) 안에 다른 프로세스가 revise/forget 을 끝내면
+   * 스냅샷 전체를 재직렬화하던 기존 구현이 상대의 변경을 흔적 없이 되돌렸다:
+   *   - revise 소실: body/confidence/history 가 이전 상태로 복귀
+   *   - forget 부활: archive 로 옮겨진 기억이 memories/ 에 되살아나 split-brain
+   *   - 강화 소실: 2프로세스 300회씩 recall 시 84~99.5% 유실
+   * 이제 쓰기 직전 파일을 다시 읽어 **그 레코드에 델타만 얹어** 기록하므로,
+   * 경쟁 프로세스가 바꾼 내용(본문·확신도·이력·상태)은 그대로 보존된다.
+   *
+   * 강화는 best-effort 다 — 쓰기에 실패해도 던지지 않는다. 회상/열람이
+   * 부수효과(강화) 실패 때문에 통째로 실패하면 안 된다.
    */
-  private reinforce(m: MemoryRecord, opts: { active: boolean; archived: boolean; preActivation: number }): void {
+  private reinforce(m: MemoryRecord, opts: { active: boolean; preActivation: number }): void {
     const now = Date.now();
-    m.accessCount += 1;
-    m.lastAccessed = nowIso();
     const sinceReinforce = now - Date.parse(m.lastReinforced);
-    if (sinceReinforce >= SPACING_WINDOW_MS) {
-      let delta = opts.active ? 1 : 0.5; // 검사효과: 능동 인출 > 수동 열람
+    const gateOpen = sinceReinforce >= SPACING_WINDOW_MS;
+    let delta = 0;
+    if (gateOpen) {
+      delta = opts.active ? 1 : 0.5; // 검사효과: 능동 인출 > 수동 열람
       if (opts.active && opts.preActivation < HARD_RETRIEVAL_ACTIVATION) {
         delta += 0.5; // 바람직한 어려움: 어렵게 찾아낸 회상은 더 큰 강화
       }
+    }
+
+    // 호출자가 들고 있는 인메모리 레코드(검색 결과로 반환됨)도 일관되게 갱신
+    m.accessCount += 1;
+    m.lastAccessed = nowIso();
+    if (delta > 0) {
       m.storageStrength += delta;
       m.lastReinforced = nowIso();
     }
-    this.vault.write(m, opts.archived);
+
+    try {
+      // 현재 디스크 상태를 다시 읽는다 — 위치(memories/archive)도 여기서 재확인된다.
+      const fresh = this.vault.find(m.slug);
+      if (!fresh) return; // 그 사이 삭제됨 → 되살리지 않는다
+      const target = fresh.record;
+      target.accessCount += 1;
+      target.lastAccessed = m.lastAccessed;
+      if (delta > 0) {
+        target.storageStrength += delta;
+        target.lastReinforced = m.lastReinforced;
+      }
+      this.vault.write(target, fresh.archived); // forget 으로 이동했으면 archive 쪽에 기록
+    } catch (err) {
+      console.error(
+        `[BigBrainMemory] 강화 기록 실패(무시): ${m.slug} — ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   private addLink(m: MemoryRecord, targetSlug: string, relation: string | undefined, archived: boolean): void {

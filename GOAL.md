@@ -55,7 +55,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
   - 어떻게: `fp + '.tmp-' + process.pid` 에 쓰고 `fs.renameSync(tmp, fp)` (동일 볼륨 = 원자적). read 경로에 최소 무결성 검증(닫는 `---` 존재) 실패 시 write-back 생략.
   - 검증: 절단 파일 3종(F1 frontmatter 절단 / F2 따옴표 중간 / F3 빈 파일) 이 고착되지 않음 — 감사 재현 스크립트 시나리오를 회귀 테스트로.
 
-- [ ] **T3. reinforce 재읽기 + 증분 적용** (A4)
+- [x] **T3. reinforce 재읽기 + 증분 적용** (A4) — 완료 2026-07-18
   - 무엇: search/read 의 강화 write-back 이 loadAll **스냅샷 전체를 재직렬화**해 동시 revise 를 되돌리고(무흔적), forget 된 기억을 부활시키고(split-brain), 강화 84~99.5% 를 소실시킨다. 3종 전부 재현 확정.
   - 왜: high — 가장 빈번한 연산(recall)이 기억 교정을 무효화한다. 다중 세션(데스크톱+Code) 이 실사용 조건.
   - 어떻게: `reinforce`(store.ts:423) 시작에서 `const fresh = this.vault.find(m.slug)` — 파일이 없거나 archive 로 이동했으면 write 생략, 있으면 fresh.record 에 delta(accessCount+1, 조건부 strength)만 적용해 write. 스냅샷 레코드를 직접 쓰지 않는다.
@@ -163,6 +163,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
 |---|---|---|
 | 2026-07-18 | 감사 완료 (47건 확정) + 본 계획 수립 | docs/native-parity-audit.md |
 | 2026-07-18 | 네이티브 5건 이관 + 브리지 전환 (SimpleMailServer) | 대체 전략 ④ 실증 |
+| 2026-07-18 | **T3** reinforce 재읽기+증분 | 스냅샷 재직렬화 → 쓰기 직전 `vault.find` 재읽기 후 델타만 적용. 파일이 사라졌으면 write 생략(부활 방지), archive 로 이동했으면 그쪽에 기록. 강화를 **best-effort** 로 전환(쓰기 실패해도 회상은 계속 — T2 발견 사항 해소). 무의미해진 `opts.archived` 파라미터 제거. 회귀 `scripts/regress-concurrency.mjs` 신설(4절) — **강화 소실률 84~99.5% → 0.0%** (2프로세스×300회, 기대 602/실측 602), revise·forget 경쟁 보존 확인. 전체 83✔/0✘ |
 | 2026-07-18 | **T2** 원자적 쓰기 | `writeFileAtomic`(같은 디렉터리 tmp → `renameSync`) 도입, `vault.write`/`writeIndex` 교체. 절단 감지는 T1 에서 선반영됨. 회귀 2절 추가(잔재 없음 / rename 실패 주입 시 원본 바이트 무변형) — 전체 67✔/0✘. **발견**: `MemoryStore.read` 가 내부 reinforce 의 쓰기 실패로 **조회 자체를 던진다**(디스크 만실·읽기전용 시 recall 전면 실패). 강화는 best-effort 여야 하므로 T3 에서 함께 처리 |
 | 2026-07-18 | **T1** 손상 파일 파싱 격리 | `Vault.read` 가 예외 대신 null 반환 + `quarantine/` 이동(원본 바이트 보존), 빈 파일·절단 파일 사전 감지, `main()` regenerateIndex try/catch. **계획 대비 변경 2건**: ④ "id 부재 시 손상 간주"는 **미채택** — gray-matter 에 옵션 객체를 넘겨 캐시 경로 자체를 차단(A2 세탁 벡터가 구조적으로 소멸)했고, id 부재 판정은 frontmatter 없는 손수 작성 Obsidian 노트를 격리해버려 Obsidian 호환을 해친다(회귀 테스트 5번이 이를 방어). ⑤ "불확실 레코드 write 금지"는 read 가 null 을 반환하게 되어 자동 해소. 회귀 `scripts/regress-corruption.mjs` 21건 신설 — 전체 59✔/0✘ |
 | 2026-07-18 | **T0** .mcp.json 죽은 경로 수정 | `D:/BigBrainMemory/dist/index.js` → `./dist/index.js`, `env.BIGBRAIN_VAULT` 제거(기본값 `<repo>/vault` 위임). 회귀 테스트 `scripts/regress-mcp-config.mjs` 신설 + `npm test` 에 편입 — 스모크 22 + 설정 11 전부 통과. 라이브 볼트 무변형(19건 유지) 확인. ※ 검증란의 "Claude Code 재시작 → /mcp 확인"은 세션 내 불가라 **동일 스폰 계약(cwd=저장소 루트, 같은 command/args)을 프로그램으로 재현**해 8개 도구 등록까지 확인하는 방식으로 대체함 — 사용자가 이 레포를 프로젝트로 열 때 최종 육안 확인 필요 |
