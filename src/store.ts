@@ -5,6 +5,7 @@ import type {
   MemoryType,
   RememberInput,
   ReviseInput,
+  SearchOutcome,
   SearchResult,
 } from "./types.js";
 
@@ -157,6 +158,20 @@ function expandTokens(tokens: string[]): string[] {
   const out = new Set(tokens);
   for (const t of tokens) for (const syn of SYNONYM_INDEX.get(t) ?? []) out.add(syn);
   return [...out];
+}
+
+/**
+ * 링크 메타데이터를 본문에서 제거한다 (감사 D6).
+ * link() 는 본문에 `## 연관 기억` 섹션과 `[[슬러그]]` 를 주입하는데, 이것이 검색
+ * 대상에 포함되면 링크만 걸린 무관한 기억이 상대 기억의 제목 토큰 질의에
+ * **직접 매칭**으로 잡히고 `include_linked: false` 로도 배제되지 않았다.
+ * 링크가 많은 허브 기억일수록 무관 질의에 끌려나오고 강화 오염도 커진다.
+ */
+function stripLinkSection(body: string): string {
+  return body
+    .replace(/\n#{1,6}\s*연관 기억[\s\S]*$/u, "")
+    .replace(/\[\[[^\]]+\]\]/gu, "")
+    .trim();
 }
 
 /** 한국어 조사 — 긴 것부터 (부분 스트립 방지) */
@@ -396,12 +411,20 @@ export class MemoryStore {
    * 질의 토큰은 한↔영 동의어로 확장되고, 직접 매칭이 0건이면 느슨한 2차 패스로
    * 연상 확산의 시드를 만든다(D1/D2).
    */
+  /** 결과 배열만 필요할 때 쓰는 편의 래퍼 (컷오프 정보가 필요하면 searchDetailed) */
   search(
     query: string,
     opts?: { type?: MemoryType; limit?: number; includeLinked?: boolean; project?: string },
   ): SearchResult[] {
+    return this.searchDetailed(query, opts).results;
+  }
+
+  searchDetailed(
+    query: string,
+    opts?: { type?: MemoryType; limit?: number; includeLinked?: boolean; project?: string },
+  ): SearchOutcome {
     const tokens = tokenize(query);
-    if (tokens.length === 0) return [];
+    if (tokens.length === 0) return { results: [], totalMatched: 0 };
     const limit = opts?.limit ?? 5;
     const all = this.loadAll(true);
     const now = Date.now();
@@ -434,7 +457,7 @@ export class MemoryStore {
       // 조사 흡수는 tokenMatch 가 담당하므로 한국어 회수율 손실은 없다.
       const titleT = tokenize(m.title);
       const descT = tokenize(m.description);
-      const bodyT = tokenize(m.body);
+      const bodyT = tokenize(stripLinkSection(m.body)); // 링크 메타데이터 제외 (D6)
       const tagT = tokenize(m.tags.join(" "));
       for (const t of expanded) {
         const w = exact.has(t) ? 1 : SYNONYM_WEIGHT;
@@ -508,7 +531,8 @@ export class MemoryStore {
           }
         }
       }
-      results = results.concat(assoc.slice(0, 3));
+      // 연상 상한도 limit 에 비례시킨다 — 종전 고정 3건은 limit 을 올려도 그대로였다 (D5)
+      results = results.concat(assoc.slice(0, Math.max(1, Math.ceil(limit / 2))));
     }
 
     // P4: 능동 회상 → 상위 결과 강화 (연상으로만 딸려온 것은 약하게)
@@ -517,7 +541,7 @@ export class MemoryStore {
       const isDirect = direct.has(r.record.slug);
       this.reinforce(r.record, { active: isDirect, preActivation: r.activation });
     }
-    return results;
+    return { results, totalMatched: kept.length };
   }
 
   /** 기억을 읽으면 강화되지만, 능동 인출(recall)보다 약하다 (P4, 검사효과) */
@@ -778,17 +802,52 @@ export class MemoryStore {
     }
   }
 
+  /**
+   * 스니펫 — **질의 토큰을 가장 많이 덮는 구간**을 고른다 (감사 D7).
+   *
+   * 종전에는 토큰 배열 순서대로 훑어 첫 매칭 토큰의 첫 등장 위치만 잘랐다.
+   * 그래서 두 토큰이 모두 있는 결론 문장이 본문에 있어도 서두의 일반론이 나왔고,
+   * 질의 어순만 바꿔도 결과가 달라졌다("타임아웃 30초" vs "30초 타임아웃").
+   * 고정 폭 윈도를 후보 위치마다 대보고 서로 다른 토큰을 가장 많이 포함하는 곳을 쓴다.
+   *
+   * 링크 메타데이터(`## 연관 기억` 섹션과 [[위키링크]])는 검색·스니펫 대상에서
+   * 제외한다 — link() 가 본문에 주입하는 것이라 콘텐츠가 아니다 (감사 D6).
+   */
   private snippet(m: MemoryRecord, tokens: string[]): string {
-    const body = m.body;
+    const body = stripLinkSection(m.body);
+    if (!body) return m.description;
     const lower = body.toLowerCase();
+
+    // 토큰별 등장 위치 수집
+    const spots: { at: number; token: string }[] = [];
     for (const t of tokens) {
-      const idx = lower.indexOf(t);
-      if (idx !== -1) {
-        const start = Math.max(0, idx - 60);
-        const end = Math.min(body.length, idx + 90);
-        return (start > 0 ? "…" : "") + body.slice(start, end).replace(/\n+/g, " ") + (end < body.length ? "…" : "");
+      let idx = -1;
+      let seen = 0;
+      while (seen < 5 && (idx = lower.indexOf(t, idx + 1)) !== -1) {
+        spots.push({ at: idx, token: t });
+        seen++;
       }
     }
-    return m.description;
+    if (spots.length === 0) return m.description;
+
+    // 각 등장 위치를 시작점 후보로 삼아 윈도가 덮는 고유 토큰 수를 센다
+    // 동점일 때는 **앞선 위치**를 택한다 — 순회 순서(=질의 어순)로 승자가 갈리면
+    // "타임아웃 30초" 와 "30초 타임아웃" 의 결과가 달라진다.
+    const WIN = 150;
+    let best = { start: 0, covered: -1 };
+    for (const s of spots) {
+      const start = Math.max(0, s.at - 60);
+      const end = start + WIN;
+      const covered = new Set(spots.filter((x) => x.at >= start && x.at < end).map((x) => x.token)).size;
+      if (covered > best.covered || (covered === best.covered && start < best.start)) {
+        best = { start, covered };
+      }
+    }
+    const end = Math.min(body.length, best.start + WIN);
+    return (
+      (best.start > 0 ? "…" : "") +
+      body.slice(best.start, end).replace(/\s+/g, " ").trim() +
+      (end < body.length ? "…" : "")
+    );
   }
 }

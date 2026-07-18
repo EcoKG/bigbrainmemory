@@ -215,10 +215,82 @@ console.log("12) 진짜 중복은 계속 탐지");
   check("근접 중복은 RIF 로 억제됨 (P5 유지)", r.some((x) => x.inhibited), r.map((x) => `${x.record.slug}:${x.inhibited}`).join(","));
 }
 
+// ── 13. 컷오프가 숨겨지지 않는다 (D5)
+console.log("13) 누락 가시화 (D5)");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  for (let i = 0; i < 20; i++) {
+    s.remember({ title: `메일 주제 ${i}`, description: `메일 관련 ${i}`, content: `메일 본문 ${i}.`, type: "semantic" });
+  }
+  const q = new MemoryStore(new Vault(dir));
+  const out = q.searchDetailed("메일");
+  check("직접 매칭 총 20건이 보고됨", out.totalMatched === 20, `total=${out.totalMatched}`);
+  check("기본 limit 으로는 5건만 표시", out.results.filter((r) => !r.snippet.startsWith("(연상")).length === 5, `len=${out.results.length}`);
+  const wide = q.searchDetailed("메일", { limit: 20 });
+  check("limit 을 올리면 전부 반환", wide.results.length === 20, `len=${wide.results.length}`);
+  check("limit 을 올려도 totalMatched 는 동일", wide.totalMatched === 20);
+}
+
+// ── 14. 연상 상한이 limit 에 비례한다 (D5)
+console.log("14) 연상 상한 비례화");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  s.remember({ title: "허브 기억", description: "중심", content: "노벰버 본문.", type: "semantic" });
+  for (let i = 0; i < 6; i++) {
+    s.remember({ title: `이웃 ${i}`, description: `이웃 설명 ${i}`, content: `무관 본문 ${i}.`, type: "semantic" });
+    s.link("허브-기억", `이웃-${i}`, "연결");
+  }
+  const q = new MemoryStore(new Vault(dir));
+  const small = q.searchDetailed("노벰버", { limit: 1 }).results.filter((r) => r.snippet.startsWith("(연상")).length;
+  const big = q.searchDetailed("노벰버", { limit: 10 }).results.filter((r) => r.snippet.startsWith("(연상")).length;
+  check("limit 이 크면 연상도 더 많이 (종전 고정 3)", big > small, `small=${small} big=${big}`);
+}
+
+// ── 15. 위키링크가 검색을 오염시키지 않는다 (D6)
+console.log("15) 링크 메타데이터 검색 제외 (D6)");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  s.remember({ title: "배포 절차서", description: "배포 순서", content: "배포 관련 본문.", type: "procedural" });
+  s.remember({ title: "커피 원두 취향", description: "에티오피아 선호", content: "커피 이야기.", type: "preference" });
+  s.link("커피-원두-취향", "배포-절차서", "무관하지만 연결됨");
+
+  const q = new MemoryStore(new Vault(dir));
+  const got = slugs(q.search("절차서", { includeLinked: false }));
+  check("링크만 걸린 무관 기억이 직접 매칭되지 않음", !got.includes("커피-원두-취향"), got.join(","));
+  check("본래 기억은 정상 매칭", got.includes("배포-절차서"), got.join(","));
+  const withLink = q.search("절차서", { includeLinked: true });
+  check("include_linked 를 켜면 연상으로는 나옴", withLink.some((r) => r.record.slug === "커피-원두-취향" && r.snippet.startsWith("(연상")));
+}
+
+// ── 16. 스니펫이 질의 토큰을 가장 많이 덮는 구간을 고른다 (D7)
+console.log("16) 스니펫 다중 토큰 커버리지 (D7)");
+{
+  const dir = freshDir();
+  const s = new MemoryStore(new Vault(dir));
+  s.remember({
+    title: "타임아웃 가이드",
+    description: "팀 위키 요약",
+    content:
+      "팀 위키 일반론: 타임아웃 값은 상황마다 달라 정답이 없다는 논의가 길게 이어졌다. " +
+      "여러 사례를 검토했고 합의에 이르지 못한 채 보류되었다. " +
+      "결론: DB 커넥션 타임아웃은 반드시 30초로 설정한다.",
+    type: "semantic",
+  });
+  const q = new MemoryStore(new Vault(dir));
+  const a = q.search("타임아웃 30초")[0].snippet;
+  const b = q.search("30초 타임아웃")[0].snippet;
+  check("어순 A 에서 결론 문장이 포함됨", a.includes("30초로 설정"), a);
+  check("어순 B 에서도 결론 문장이 포함됨", b.includes("30초로 설정"), b);
+  check("질의 어순에 따라 결과가 달라지지 않음", a === b, `A=${a}\n       B=${b}`);
+}
+
 for (const d of cleanups) fs.rmSync(d, { recursive: true, force: true });
 
 if (failures > 0) {
   console.error(`\n실패: ${failures}건`);
   process.exit(1);
 }
-console.log("\nT15/T16 검색 확장·정밀화 회귀 테스트 통과 ✔");
+console.log("\nT15/T16/T17 검색 회귀 테스트 통과 ✔");

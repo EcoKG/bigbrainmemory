@@ -74,6 +74,12 @@ export interface ReviseInput {
   reason: string;
 }
 
+export interface SearchOutcome {
+  results: SearchResult[];
+  /** 컷오프 전 직접 매칭 총 건수 — 에이전트가 누락 존재를 알 수 있게 (감사 D5) */
+  totalMatched: number;
+}
+
 export interface SearchResult {
   record: MemoryRecord;
   score: number;

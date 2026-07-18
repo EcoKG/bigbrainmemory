@@ -266,7 +266,12 @@ server.registerTool(
   },
   async ({ query, type, limit, include_linked, project }) => {
     const scope = project === undefined ? DEFAULT_PROJECT : project || undefined;
-    const results = store.search(query, { type, limit, includeLinked: include_linked, project: scope });
+    const { results, totalMatched } = store.searchDetailed(query, {
+      type,
+      limit,
+      includeLinked: include_linked,
+      project: scope,
+    });
     if (results.length === 0) {
       // 0건에 곧장 remember 를 권하면 "사실은 있는데 표현이 어긋난" 기억이 중복 저장된다.
       // 재질의를 먼저 유도한다 (감사 D2).
@@ -275,7 +280,18 @@ server.registerTool(
         note: "No memories matched this query. Before concluding nothing is stored: retry with different wording (synonyms, the other language, a broader single keyword), or call `list_memories` to see what exists. Only use `remember` once you are confident this is genuinely new.",
       });
     }
-    return ok({ results: results.map(searchHit) });
+    const shownDirect = results.filter((r) => !r.snippet.startsWith("(연상")).length;
+    return ok({
+      results: results.map(searchHit),
+      total_matched: totalMatched,
+      // 컷오프가 있었으면 알린다 — 종전에는 상한에 잘린 사실 자체가 노출되지 않아
+      // 에이전트가 "이게 전부" 라고 믿고 재질의할 계기가 없었다 (감사 D5)
+      ...(totalMatched > shownDirect
+        ? {
+            truncated: `직접 매칭 ${totalMatched}건 중 ${shownDirect}건만 표시했습니다. 더 필요하면 limit 을 올려 재질의하세요 (최대 20).`,
+          }
+        : {}),
+    });
   },
 );
 
