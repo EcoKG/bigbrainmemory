@@ -21,6 +21,47 @@ const MEMORY_TYPE = z
     "Memory type: episodic (events/experiences), semantic (facts/knowledge), procedural (how-to/workflows), preference (user tastes/style)",
   );
 
+/** instructions 에 실을 기억 인덱스 최대 건수 (컨텍스트 예산 보호) */
+const INDEX_LIMIT = Number(process.env.BIGBRAIN_INDEX_LIMIT) || 40;
+
+/**
+ * 서버 기동 시점의 기억 인덱스를 instructions 에 덧붙인다 (감사 E1).
+ *
+ * 네이티브 메모리는 MEMORY.md 내용 자체가 매 세션 시스템 프롬프트에 주입돼
+ * 모델이 "무엇이 저장돼 있는지" 를 보고 시작한다. BigBrainMemory 는 vault/MEMORY.md 를
+ * 생성만 하고 어떤 경로로도 재노출하지 않아, 볼트에 무엇이 있는지 모르는 모델이
+ * recall 키워드를 추측해야 했다 — 표층 문자열 검색(D1)과 겹치면 첫 질의가 0건이 되기 쉽다.
+ *
+ * MCP instructions 는 클라이언트가 세션 컨텍스트에 실어주므로, 여기에 제목·설명
+ * 한 줄 인덱스를 붙이면 "무엇이 있는지" 가 자동 노출된다.
+ * 주의: 이 스냅샷은 **서버 기동 시점** 기준이다. 항상 최신이 필요하면
+ * SessionStart 훅으로 vault/MEMORY.md 를 주입하는 방법을 README 참조.
+ */
+function memoryIndexLines(): string[] {
+  let items: ReturnType<typeof store.list>;
+  try {
+    items = store.list();
+  } catch (err) {
+    console.error(
+      `[BigBrainMemory] 인덱스 요약 생략(계속 진행): ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return [];
+  }
+  if (items.length === 0) {
+    return ["", "The vault is currently EMPTY — no memories stored yet. Use `remember` as you learn durable facts."];
+  }
+  const shown = items.slice(0, INDEX_LIMIT);
+  const head =
+    items.length > shown.length
+      ? `Vault index — ${items.length} memories stored, ${shown.length} most recently updated shown. Use \`recall\` for the full text and anything not listed:`
+      : `Vault index — ${items.length} memories currently stored. Use \`recall\` to read the full text:`;
+  return [
+    "",
+    head,
+    ...shown.map((m) => `- [${m.type}] ${m.title} — ${m.description}`),
+  ];
+}
+
 const server = new McpServer(
   { name: "bigbrainmemory", version: "0.1.0" },
   {
@@ -34,6 +75,7 @@ const server = new McpServer(
       "5. REFLECT — periodically call `reflect` to find weakened, low-confidence, or duplicate memories and clean them up (forget candidates are surfaced, never auto-deleted).",
       "Two independent dimensions (do not conflate them): `confidence` = how likely the memory is TRUE (change only via `revise`); recall accessibility = base-level activation from frequency+recency, computed automatically. A rarely-recalled memory can still be highly trusted, and vice versa.",
       "Record a `source` when you know where a fact came from — it prevents source confusion later. Memories are stored verbatim and never auto-merged; consolidate only via explicit `revise`.",
+      ...memoryIndexLines(),
     ].join("\n"),
   },
 );

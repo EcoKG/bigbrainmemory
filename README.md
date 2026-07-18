@@ -93,17 +93,61 @@ npm test        # 전체 기억 사이클 스모크 테스트
 
 **이 프로젝트에서만** — 저장소의 [.mcp.json](.mcp.json)이 자동 적용됩니다.
 
-**모든 프로젝트에서 (권장)** — 기억은 프로젝트를 넘나들 때 가치가 커집니다:
+**모든 프로젝트에서 (권장)** — 기억은 프로젝트를 넘나들 때 가치가 커집니다. `<저장소경로>`는 이 저장소를 클론한 실제 경로로 바꾸세요:
 
 ```bash
-claude mcp add --scope user bigbrainmemory -- node D:/BigBrainMemory/dist/index.js
+claude mcp add --scope user bigbrainmemory -- node <저장소경로>/dist/index.js
 ```
 
-**볼트 위치 변경** — 기존 Obsidian 볼트를 쓰려면 환경변수를 지정합니다:
+**볼트 위치 변경** — 기존 Obsidian 볼트를 쓰려면 환경변수를 지정합니다. 지정하지 않으면 `<저장소경로>/vault`가 기본값입니다:
 
 ```bash
-claude mcp add --scope user -e BIGBRAIN_VAULT="C:/Users/me/MyObsidianVault/BigBrain" bigbrainmemory -- node D:/BigBrainMemory/dist/index.js
+claude mcp add --scope user -e BIGBRAIN_VAULT="C:/Users/me/MyObsidianVault/BigBrain" bigbrainmemory -- node <저장소경로>/dist/index.js
 ```
+
+## 회상 트리거 — "무엇이 저장돼 있는지" 알리기
+
+저장해도 **꺼내 쓰지 않으면 없는 것과 같습니다.** MCP 서버에는 자동 호출 장치가 없어서
+`recall` 은 모델이 스스로 부를 때만 실행됩니다. 그래서 "볼트에 무엇이 있는지" 를
+세션 컨텍스트에 노출하는 3중 채널을 씁니다 — 하나만 써도 되지만 병행할수록 확실합니다.
+
+**① 서버 instructions (자동, 설정 불필요)**
+서버가 기동할 때 기억 인덱스(제목 + 한 줄 설명)를 instructions 끝에 붙여 보냅니다.
+MCP 클라이언트가 이를 세션 컨텍스트에 실어주므로 별도 설정 없이 동작합니다.
+`BIGBRAIN_INDEX_LIMIT`(기본 40)으로 건수를 조절할 수 있습니다.
+한계: **서버 기동 시점 스냅샷**이라 그 뒤에 저장한 기억은 재시작 전까지 인덱스에 없습니다
+(단, `recall` 로는 즉시 조회됩니다).
+
+**② SessionStart 훅 (항상 최신)**
+매 세션 시작 시 `vault/MEMORY.md`(자동 생성되는 인덱스)를 컨텍스트에 주입합니다.
+`~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f '<저장소경로>/vault/MEMORY.md' ]; then echo '<bigbrainmemory-index>'; head -c 8000 '<저장소경로>/vault/MEMORY.md'; echo '</bigbrainmemory-index>'; fi",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`UserPromptSubmit` 이 아니라 `SessionStart` 를 쓰는 이유: 전자는 매 턴 중복 주입돼
+컨텍스트를 낭비합니다. `head -c` 는 볼트가 커져도 예산을 넘지 않게 하는 안전장치입니다.
+
+**③ 네이티브 메모리 브리지**
+Claude Code 의 프로젝트별 메모리(`~/.claude/projects/<프로젝트>/memory/MEMORY.md`)는
+매 세션 자동 주입됩니다. 이 파일에 "장기 기억은 bigbrainmemory 의 `recall` 로 조회" 라는
+안내와 핵심 항목 목록을 남겨두면, 네이티브의 자동 주입에 편승할 수 있습니다.
+프로젝트 단위로 다른 안내를 주고 싶을 때 유용합니다.
 
 ## 기술 스택
 

@@ -81,7 +81,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
 
 ## Phase P1 — 대체 가능 조건 (트리거·스코핑·안전망)
 
-- [ ] **T7. 회상 트리거 삼중화** (E1, 대체 전략 ①)
+- [x] **T7. 회상 트리거 삼중화** (E1, 대체 전략 ①) — 완료 2026-07-18
   - 무엇: 볼트에 "무엇이 저장돼 있는지"가 어떤 경로로도 자동 노출되지 않는다 — recall 이 모델 자발성에 100% 의존.
   - 왜: high — 대체의 최대 관문. 네이티브는 MEMORY.md 가 매 세션 주입된다.
   - 어떻게: ① index.ts 기동 시 instructions 끝에 `store.list().slice(0,40).map(m => '- ['+m.type+'] '+m.title+' — '+m.description)` 부착 ② 사용자 확인 후 Claude Code `SessionStart` 훅 등록 — `vault/MEMORY.md` 를 stdout 출력 (머신 설정 — 공통 규칙 7) ③ 브리지 파일(네이티브 memory/MEMORY.md) 패턴을 README 에 공식 문서화.
@@ -163,6 +163,7 @@ BigBrainMemory 가 Claude Code 네이티브 메모리를 **완전 대체**한다
 |---|---|---|
 | 2026-07-18 | 감사 완료 (47건 확정) + 본 계획 수립 | docs/native-parity-audit.md |
 | 2026-07-18 | 네이티브 5건 이관 + 브리지 전환 (SimpleMailServer) | 대체 전략 ④ 실증 |
+| 2026-07-18 | **T7** 회상 트리거 삼중화 | ① `memoryIndexLines()` 가 기동 시 기억 인덱스(제목+설명+타입)를 instructions 에 부착, `BIGBRAIN_INDEX_LIMIT`(기본 40) 상한·총건수 안내·빈 볼트 명시. ② **사용자 승인 후** `~/.claude/settings.json` 에 SessionStart 훅 추가 — `vault/MEMORY.md` 를 `<bigbrainmemory-index>` 태그로 감싸 주입(`head -c 8000` 상한). 기존 Orca 훅 10종 무변경, 백업 `settings.json.bak-bbm-20260718`. 실제 실행해 3,224자 출력 확인. ③ README 에 3중 채널 문서화 + 죽은 `D:/` 경로 정리. 회귀 `scripts/regress-trigger.mjs` 신설(12건, `client.getInstructions()` 로 실제 스폰 검증) — 전체 131✔/0✘ |
 | 2026-07-18 | **P0 완료** — 데이터 안전 6/6 | T1~T6 전부 통과. 회귀 테스트 4종 118✔/0✘ 로 감사 재현 시나리오 고정 |
 | 2026-07-18 | **T6** revise 구본 스냅샷 | `vault.snapshotRevision()` — 덮어쓰기 전 `archive/revisions/<slug>.<ts>.md` 로 복사, slug 당 최근 3세대 유지(사전순=시간순 정렬로 만료). **내용이 실제로 바뀔 때만** 스냅샷(재확인 revise 는 낭비 안 함). 같은 밀리초 충돌 시 접미로 회피. 스냅샷 실패는 교정을 막지 않음(경고만). `listSlugs` 가 archive 를 재귀 탐색하지 않아 기억 목록·검색·reflect 에 안 섞임을 테스트로 고정. README 에 볼트 git 백업 권고 + 디렉터리 구조 갱신. 회귀 3·4절 추가 — 전체 118✔/0✘ |
 | 2026-07-18 | **T5** YAML Date 허용 | `str()` 가 `Date` 인스턴스를 `toISOString()` 으로 수용(Invalid Date 는 기본값). 회귀 `scripts/regress-obsidian-edit.mjs` 신설(1·2절) — 인용 없는 `created: 2025-01-01T…`·날짜만 형식 `2025-02-02` 모두 보존, 기저활성 부풀림 없음, write-back 후에도 고착 안 됨, 기존 형식 왕복 무손실. 전체 105✔/0✘ |
