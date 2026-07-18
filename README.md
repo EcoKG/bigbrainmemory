@@ -117,6 +117,16 @@ source: 코드 리뷰 대화
 
 서버 `instructions`에는 행동 수칙(recall 먼저 → remember → 모순되면 revise/forget → 주기적 reflect)에 더해 **기억 인덱스**, 프로젝트 스코프 안내, 나이 해석 지침이 함께 실립니다.
 
+### 정리 프롬프트
+
+`reflect`는 후보만 내놓습니다. 실제 정리(중복 병합·낡은 사실 교정·고아 연결)까지 이어가려면 Claude Code에서 슬래시 커맨드를 부르세요:
+
+```
+/mcp__bigbrainmemory__consolidate
+```
+
+`reflect`의 모든 출력 항목에 대한 처리 절차가 로드됩니다 — 중복 쌍을 양쪽 다 읽고 비교해 병합, 망각 후보를 현재 사실과 대조, 고아를 연결, 마지막에 재확인. 파괴적 조치에는 안전장치가 걸려 있습니다(애매하면 `forget` 대신 `revise`로 확신도를 낮추도록).
+
 ## 회상 품질
 
 검색은 임베딩 없는 토큰 매칭입니다. 그 한계를 메우는 장치가 셋 있습니다.
@@ -132,7 +142,7 @@ source: 코드 리뷰 대화
 ```bash
 npm install
 npm run build
-npm test          # 스모크 1종 + 회귀 11종 (총 279개 단언)
+npm test          # 스모크 1종 + 회귀 14종 (총 363개 단언)
 ```
 
 `npm test`는 실제 stdio MCP 서버를 띄우고 임시 볼트에 파일을 쓰므로 수십 초 걸립니다. 개별 실행:
@@ -150,7 +160,27 @@ npm run test:quiet        # 조회 부작용
 npm run test:activation   # 기저활성·임계
 npm run test:spacing      # 확장 간격·강화
 npm run test:search       # 동의어·폴백·정밀도
+npm run test:prompt       # consolidate 프롬프트
+npm run test:import       # 네이티브 이관
+npm run test:perf         # id 캐시·이력 상한·예약명
 ```
+
+## 네이티브 메모리에서 이관
+
+Claude Code의 프로젝트별 메모리(`~/.claude/projects/<슬러그>/memory/*.md`)를 볼트로 옮깁니다.
+
+```bash
+npm run import:native              # 미리보기 — 아무것도 쓰지 않습니다
+npm run import:native -- --apply   # 실제 이관
+```
+
+- 타입 매핑: `user`→preference, `feedback`→procedural(실행 지침이 있으면)/preference, `project`→episodic(시점·사건)/semantic, `reference`→procedural. **왜 그 타입이 됐는지 항상 출력**하므로 확인하고 `revise`로 고칠 수 있습니다.
+- 프로젝트 슬러그가 `project` 스코프로 들어갑니다.
+- `source`에 원본 경로를 남겨 **멱등**합니다 — 여러 번 돌려도 중복되지 않습니다.
+- 제목은 원본 `name`을 그대로 써서 본문의 `[[위키링크]]`가 유지됩니다.
+- 경로 지정: `--projects-dir <경로>` `--vault <경로>`
+
+이관 후 원본은 지우지 말고 아카이브해 두고, 네이티브 `memory/MEMORY.md`는 "`recall`로 조회" 안내로 바꿔 [브리지](#회상-트리거--무엇이-저장돼-있는지-알리기)로 남기는 것을 권합니다.
 
 ## Claude Code에 등록
 
