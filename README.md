@@ -239,8 +239,31 @@ claude mcp add --scope user -e BIGBRAIN_VAULT="C:/Users/me/MyObsidianVault/BigBr
 서버가 기동할 때 기억 인덱스(제목 + 한 줄 설명 + 타입)를 instructions 끝에 붙여 보냅니다. `BIGBRAIN_INDEX_LIMIT`(기본 40)으로 건수를 조절하고, `0`이면 목록을 생략합니다(스코프 안내는 유지). 스코프가 설정돼 있으면 그 프로젝트 기억과 전역 기억만 실립니다.
 한계: **서버 기동 시점 스냅샷**이라 그 뒤에 저장한 기억은 재시작 전까지 인덱스에 없습니다(단, `recall`로는 즉시 조회됩니다).
 
-**② SessionStart 훅 (항상 최신)**
-매 세션 시작 시 `MEMORY.md`를 컨텍스트에 주입합니다. `~/.claude/settings.json`에서 — `BIGBRAIN_VAULT`를 지정했다면 **그 볼트 경로**를 쓰세요:
+볼트가 비어 있으면(콜드 스타트) 인덱스로 노출할 것이 없으므로, 그 자리를 **행동 지시로 대체**합니다 — "빈 `recall` 결과는 기억이 불필요하다는 증거가 아니다", "트리거가 걸리면 세션 끝까지 미루지 말고 그 즉시 저장하라". 종전에는 이 상황에서 한 문장만 나가고 스코프 안내마저 빠졌는데, 설득이 가장 필요한 시점에 가장 약하게 말하는 역전이었습니다.
+
+**② SessionStart 훅 (항상 최신) — 명령 한 번으로 설치**
+
+매 세션 시작 시 `MEMORY.md`를 컨텍스트에 주입합니다. 채널 ①이 기동 시점 스냅샷인 반면 이쪽은 **항상 최신**이라, 세 채널 중 실효가 가장 큽니다.
+
+```bash
+npm run setup:hook                    # 설치 (백업 후 적용)
+npm run setup:hook -- --dry-run       # 무엇이 바뀌는지만 확인
+npm run setup:hook -- --remove        # 제거
+npm run setup:hook -- --vault <경로>     # 볼트 경로 직접 지정
+npm run setup:hook -- --settings <경로>  # 대상 settings.json 지정(프로젝트 스코프 등)
+```
+
+스크립트가 처리하는 것:
+
+- **OS 분기** — Windows는 PowerShell, POSIX는 `sh` 명령을 각각 생성합니다. 아래 수동 JSON은 POSIX 전용이라 **Windows에서는 그대로 쓰면 동작하지 않습니다.**
+- **셸 변수 회피** — 명령 문자열에 `$`를 쓰면 호스트 셸이 먼저 치환해 명령이 깨집니다. 양쪽 명령 모두 변수를 쓰지 않습니다.
+- **볼트 경로 주입** — 등록된 MCP 서버 설정(`~/.claude.json`)에서 실제 `BIGBRAIN_VAULT`를 읽어 맞춥니다. 훅이 서버와 다른 볼트를 보면 조용히 빈 인덱스를 주입하게 됩니다.
+- **기존 설정 병합** — 다른 훅을 쓰고 있어도 덮어쓰지 않고 항목만 더합니다. 재실행해도 중복되지 않습니다(멱등).
+- **안전장치** — 쓰기 전에 명령을 실제로 실행해 검증하고, 타임스탬프 백업을 남기며, 쓴 뒤 JSON을 재파싱해 깨졌으면 백업에서 복구합니다.
+
+`postinstall`로 자동 실행하지 않는 이유: 전역 설정을 몰래 고치는 것은 나쁜 관행이고, Claude Code를 쓰지 않는 사용자나 CI에서도 실행되어 버립니다.
+
+수동으로 넣고 싶다면 `~/.claude/settings.json`에 아래를 추가합니다(**POSIX 전용** — `<볼트경로>`는 `BIGBRAIN_VAULT`를 지정했다면 그 경로):
 
 ```json
 {
@@ -260,7 +283,7 @@ claude mcp add --scope user -e BIGBRAIN_VAULT="C:/Users/me/MyObsidianVault/BigBr
 }
 ```
 
-`UserPromptSubmit`이 아니라 `SessionStart`를 쓰는 이유: 전자는 매 턴 중복 주입돼 컨텍스트를 낭비합니다. `head -c`는 볼트가 커져도 예산을 넘지 않게 하는 안전장치입니다.
+`UserPromptSubmit`이 아니라 `SessionStart`를 쓰는 이유: 전자는 매 턴 중복 주입돼 컨텍스트를 낭비합니다. `head -c`(Windows는 `-TotalCount`)는 볼트가 커져도 예산을 넘지 않게 하는 안전장치입니다.
 
 **③ 네이티브 메모리 브리지**
 Claude Code의 프로젝트별 메모리(`~/.claude/projects/<프로젝트>/memory/MEMORY.md`)는 매 세션 자동 주입됩니다. 이 파일에 "장기 기억은 bigbrainmemory의 `recall`로 조회"라는 안내와 핵심 항목 목록을 남겨두면 네이티브의 자동 주입에 편승할 수 있습니다. 프로젝트 단위로 다른 안내를 주고 싶을 때 유용합니다.

@@ -88,13 +88,71 @@ console.log("1) 기억 인덱스 자동 노출 (E1)");
   check("타입 표기 포함", instructions.includes("[procedural]") && instructions.includes("[semantic]"));
 }
 
-// ── 2. 빈 볼트는 비어 있다고 명시한다
-console.log("2) 빈 볼트 표기");
+// ── 2. 빈 볼트(콜드 스타트)는 비어 있다고 명시하고, 오히려 지시를 강하게 준다
+//
+// 종전에는 빈 볼트일 때 한 문장만 내보냈고, 조기 반환 탓에 스코프 안내까지 통째로
+// 빠졌다 — 설득이 가장 필요한 콜드 스타트에서 가장 약하게 말하는 역전이었다.
+// 여기서는 (a) 비었다는 사실, (b) 빈 recall 을 "불필요" 로 오해하지 말라는 지시,
+// (c) 즉시 저장하라는 행동 지시, (d) 스코프 안내 누락 없음 을 모두 고정한다.
+console.log("2) 빈 볼트(콜드 스타트) 표기");
 {
   const dir = freshDir();
   const { instructions } = await boot(dir);
-  check("EMPTY 안내 노출", /vault is currently EMPTY/i.test(instructions), instructions.slice(-300));
+  check("EMPTY 사실 노출", /vault is EMPTY/i.test(instructions), instructions.slice(-400));
+  check("콜드 스타트로 명시", /COLD START/i.test(instructions), instructions.slice(-400));
+  check(
+    "빈 recall 을 '기억 불필요' 로 오해하지 말라는 지시",
+    /NOT evidence that memory is unneeded/i.test(instructions),
+    instructions.slice(-400),
+  );
+  check(
+    "즉시 저장 행동 지시(끝까지 미루지 말 것)",
+    /rather than deferring to the end of the session/i.test(instructions),
+    instructions.slice(-400),
+  );
   check("행동수칙은 그대로", instructions.includes("RECALL FIRST"));
+}
+
+// ── 2-b. 빈 볼트여도 프로젝트 스코프 안내가 사라지지 않는다 (조기 반환 버그 회귀 방지)
+console.log("2-b) 빈 볼트 + 프로젝트 스코프");
+{
+  const dir = freshDir();
+  const { instructions } = await boot(dir, { BIGBRAIN_PROJECT: "acme" });
+  check("EMPTY 사실 노출", /vault is EMPTY/i.test(instructions));
+  check(
+    "스코프 안내가 빈 볼트에서도 실린다",
+    instructions.includes('Current project scope: "acme"'),
+    instructions.slice(-500),
+  );
+  check(
+    "스코프별 저장 지침도 함께",
+    /omit `project` for knowledge that should follow the user everywhere/.test(instructions),
+    instructions.slice(-500),
+  );
+}
+
+// ── 2-c. REMEMBER 규칙에 관측 가능한 이벤트 앵커가 있다
+//
+// "after learning a durable fact" 는 경계가 없어 모델이 저장 시점을 판정할 수 없었다
+// (무저장 세션의 주원인). RECALL 의 "at the start of a task" 처럼 감지 가능한 사건이어야 한다.
+console.log("2-c) REMEMBER 이벤트 앵커");
+{
+  const dir = freshDir();
+  const { instructions } = await boot(dir);
+  check("관측 가능 사건으로 명시", /OBSERVABLE events/.test(instructions), instructions.slice(0, 900));
+  for (const anchor of [
+    "wrote or edited a durable doc",
+    "corrected you",
+    "unfamiliar codebase",
+    "non-obvious root cause",
+  ]) {
+    check(`앵커 포함: ${anchor}`, instructions.includes(anchor));
+  }
+  check(
+    "내장 메모리와 별개 저장소임을 선언",
+    instructions.includes("SEPARATE STORE"),
+    instructions.slice(0, 1200),
+  );
 }
 
 // ── 3. 상한 초과 시 총건수와 표시건수를 함께 알린다

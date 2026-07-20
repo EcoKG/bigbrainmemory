@@ -78,9 +78,6 @@ function memoryIndexLines(): string[] {
     );
     return [];
   }
-  if (items.length === 0) {
-    return ["", "The vault is currently EMPTY — no memories stored yet. Use `remember` as you learn durable facts."];
-  }
   const scope = DEFAULT_PROJECT
     ? [
         "",
@@ -88,6 +85,23 @@ function memoryIndexLines(): string[] {
         `When storing, set \`project: "${DEFAULT_PROJECT}"\` for facts that only apply here; omit \`project\` for knowledge that should follow the user everywhere (preferences, general workflows).`,
       ]
     : [];
+  /**
+   * 콜드 스타트(0건)일수록 지시를 **강하게** 준다.
+   *
+   * 종전에는 빈 볼트일 때 한 문장만 내보내고, 조기 반환 탓에 위 스코프 안내마저
+   * 건너뛰었다 — 설득이 가장 필요한 시점에 가장 약하게 말하는 역전이었다.
+   * 실제로 빈 볼트 세션이 0건 저장으로 끝나는 사례가 보고됐다.
+   * 인덱스로 노출할 것이 없을수록 그 자리를 행동 지시로 채운다.
+   */
+  if (items.length === 0) {
+    return [
+      ...scope,
+      "",
+      "COLD START — this vault is EMPTY (0 memories stored).",
+      "`recall` will therefore return nothing. That is expected on a fresh vault and is NOT evidence that memory is unneeded or that the server is broken — do not silently skip storing because the first recall came back empty.",
+      "Seeding the vault is part of this session's job: the moment any REMEMBER trigger above fires, call `remember` at that point rather than deferring to the end of the session — there may be no end-of-session turn in which to catch up.",
+    ];
+  }
   if (INDEX_LIMIT === 0) return scope; // 인덱스 생략 (스코프 안내는 유지)
   const shown = items.slice(0, INDEX_LIMIT);
   const head =
@@ -111,10 +125,16 @@ const server = new McpServer(
       "BigBrainMemory is a persistent, human-like memory vault (Obsidian-compatible markdown).",
       "Behave like a person with long-term memory:",
       "1. RECALL FIRST — at the start of a task, or when the user mentions past context, call `recall` before answering.",
-      "2. REMEMBER — after learning a durable fact, decision, preference, or lesson, call `remember` (not for trivia that only matters this conversation).",
+      // \"after learning\" 은 경계가 없어 모델이 시점을 판정할 수 없었다(무저장 세션의 주원인).
+      // RECALL 의 \"at the start of a task\" 처럼 **관측 가능한 사건**으로 앵커를 바꾼다.
+      "2. REMEMBER — call `remember` as soon as any of these OBSERVABLE events happens, at that moment rather than at the end of the session: (a) you wrote or edited a durable doc (CLAUDE.md, README, design/spec notes) and a decision got settled in it; (b) the user corrected you, or stated a preference or constraint; (c) you finished exploring an unfamiliar codebase and formed a conclusion you would want next time; (d) you found a non-obvious root cause; (e) a convention, workflow, or naming rule was agreed. Skip trivia that only matters inside this conversation.",
       "3. CORRECT — when new information contradicts an existing memory, call `revise` (fixable) or `forget` (wrong memory) instead of piling up duplicates. If `remember` reports similar memories, prefer revising them.",
       "4. ASSOCIATE — connect related memories with `link` so recall can spread across them.",
       "5. REFLECT — periodically call `reflect` to find weakened, low-confidence, or duplicate memories and clean them up (forget candidates are surfaced, never auto-deleted).",
+      // 내장 파일 메모리(CLAUDE.md 등)와 이 볼트는 **서로 다른 저장소**다.
+      // 이 구분을 명시하지 않으면 "CLAUDE.md 가 이미 기록하는 것은 저장하지 말라" 류의
+      // 일반 규칙이 볼트 저장까지 함께 억제한다(무저장 세션의 두 번째 원인).
+      "SEPARATE STORE — this vault is a different store from CLAUDE.md, project docs, or any built-in file memory, and is reached only through `recall`. A fact written into CLAUDE.md is not retrievable by `recall` from another project or session, so recording a durable fact here is not duplication even when a project file also mentions it. Judge what to store by the REMEMBER triggers above, not by whether some other file happens to cover it.",
       "Two independent dimensions (do not conflate them): `confidence` = how likely the memory is TRUE (change only via `revise`); recall accessibility = base-level activation from frequency+recency, computed automatically. A rarely-recalled memory can still be highly trusted, and vice versa.",
       "Record a `source` when you know where a fact came from — it prevents source confusion later. Memories are stored verbatim and never auto-merged; consolidate only via explicit `revise`.",
       "Every result carries `age_days` (days since last update). A memory is a point-in-time observation, not live state: when it cites code, file paths, versions or config and `stale_hint` is present, verify against the current source before asserting it as fact — and `revise` it when reality has moved on.",
