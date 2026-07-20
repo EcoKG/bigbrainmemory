@@ -23,13 +23,19 @@ const MARKER = ".bbm-session-start";
 /** 주입할 MEMORY.md 최대 줄 수 — 볼트가 커져도 컨텍스트 예산을 넘지 않게 하는 안전장치 */
 const MAX_LINES = 200;
 /**
- * 이 줄 수보다 짧은 트랜스크립트에서는 무저장 경고를 띄우지 않는다.
- * Stop 은 **매 턴** 발화하므로, 첫 턴부터 "저장할 게 없느냐" 고 묻는 건 소음이다.
- * 한두 마디 묻고 끝나는 대화에는 애초에 남길 durable 한 사실이 없다.
+ * 무저장 경고를 띄우기 위한 최소 **도구 호출 수**. 한두 마디 묻고 끝나는 대화에는
+ * 애초에 남길 durable 한 사실이 없으므로, 실제로 작업한 세션에만 말을 건다.
+ *
+ * 왜 줄 수가 아니라 도구 호출 수인가 — 처음엔 트랜스크립트 25줄로 걸렀는데,
+ * 실측 1439개 트랜스크립트에 대보니 **명백히 틀린 지표**였다:
+ *   · 도구를 3회 이상 쓴 진짜 작업 세션 1285개 중 486개(38%)가 25줄 미만이라 침묵당함
+ *   · 줄 수와 작업량이 무관함 — 4줄짜리 93KB 트랜스크립트가 흔하다(한 줄이 거대함)
+ * 도구 호출 수로 바꾸니 분포가 깨끗하게 갈렸다: 0회 118개(잡담) / 1~2회 36개 /
+ * 3회 이상 1285개(작업). 실패 사례로 보고된 호출열(Grep Read Read Read 등)도 전부 3 이상이다.
  */
-const MIN_TRANSCRIPT_LINES = (() => {
-  const v = Number(process.env.BIGBRAIN_STOP_MIN_LINES);
-  return Number.isFinite(v) && v >= 0 ? v : 25;
+const MIN_TOOL_USES = (() => {
+  const v = Number(process.env.BIGBRAIN_STOP_MIN_TOOLS);
+  return Number.isFinite(v) && v >= 0 ? v : 3;
 })();
 /** 훅 입력(stdin) 을 기다리는 한계 시간 — 넘기면 없는 셈 치고 진행한다(행 방지) */
 const STDIN_TIMEOUT_MS = 250;
@@ -54,23 +60,37 @@ function readJson(fp) {
   }
 }
 
-/** mcpServers 맵에서 bigbrain 계열 서버의 BIGBRAIN_VAULT 를 찾는다 */
-function vaultFromServers(servers) {
+/**
+ * mcpServers 맵에서 이 서버의 항목을 찾아 `{ name, vault }` 로 돌려준다.
+ *
+ * **등록 키 이름만으로 찾으면 안 된다.** 종전에는 `/bigbrain/i` 로 키를 걸렀는데,
+ * 사용자가 `bbm` · `memory` · `brain` 같은 이름으로 등록하면 항목을 통째로 놓친다.
+ * 그 결과가 특히 나쁘다 — 볼트는 전역 폴백으로 새고, 도구 이름은 하드코딩된
+ * `mcp__bigbrainmemory__remember` 로 나간다. 지연 로드된 도구는 **정확한 이름으로만**
+ * 부를 수 있으므로, 존재하지 않는 이름을 광고하면 모델이 로드에 실패하고
+ * "메모리를 쓸 수 없다" 고 결론짓는다. 아무것도 주입하지 않느니만 못하다.
+ *
+ * 그래서 이름이 아니라 **실체**로 판별한다: BIGBRAIN_VAULT 를 들고 있거나,
+ * 실행 명령이 이 패키지를 가리키거나, 키가 bigbrain 계열이거나.
+ */
+function findServer(servers) {
   if (!servers || typeof servers !== "object") return null;
-  for (const [name, cfg] of Object.entries(servers)) {
-    if (!/bigbrain/i.test(name)) continue;
-    const v = cfg?.env?.BIGBRAIN_VAULT;
-    if (typeof v === "string" && v.trim() !== "") return v;
-  }
-  return null;
+  const looksLikeUs = (name, cfg) => {
+    if (/bigbrain/i.test(name)) return true;
+    if (typeof cfg?.env?.BIGBRAIN_VAULT === "string" && cfg.env.BIGBRAIN_VAULT.trim() !== "") return true;
+    const cmd = [cfg?.command, ...(Array.isArray(cfg?.args) ? cfg.args : [])].filter((x) => typeof x === "string").join(" ");
+    return /bigbrainmemory/i.test(cmd);
+  };
+  // 볼트를 실제로 들고 있는 항목을 우선한다 — 여러 개가 걸릴 때 더 구체적인 쪽이다
+  const entries = Object.entries(servers).filter(([n, c]) => looksLikeUs(n, c));
+  const withVault = entries.find(([, c]) => typeof c?.env?.BIGBRAIN_VAULT === "string" && c.env.BIGBRAIN_VAULT.trim() !== "");
+  const [name, cfg] = withVault ?? entries[0] ?? [];
+  if (!name) return null;
+  const v = cfg?.env?.BIGBRAIN_VAULT;
+  return { name, vault: typeof v === "string" && v.trim() !== "" ? v : null };
 }
-
-/** mcpServers 맵에서 bigbrain 계열 서버의 **등록 키 이름** 을 찾는다 */
-function serverNameFromServers(servers) {
-  if (!servers || typeof servers !== "object") return null;
-  for (const name of Object.keys(servers)) if (/bigbrain/i.test(name)) return name;
-  return null;
-}
+const vaultFromServers = (servers) => findServer(servers)?.vault ?? null;
+const serverNameFromServers = (servers) => findServer(servers)?.name ?? null;
 
 /**
  * 주입문에 박을 MCP 도구 이름의 서버 키를 해석한다 (`mcp__<서버키>__remember`).
@@ -334,15 +354,13 @@ if (countMemories() > m.count) process.exit(0); // 저장됐다 — 조용히 �
 // 그래서 세션당 한 번만 알린다.
 if (m.warned) process.exit(0);
 
-// 짧은 대화에는 애초에 남길 durable 한 사실이 없다 — 트랜스크립트가 자랄 때까지 기다린다.
-// 길이를 못 재면 종전대로 알린다(모른다고 침묵하면 안전망이 사라진다).
-if (hookInput.transcriptPath && MIN_TRANSCRIPT_LINES > 0) {
+// 실제로 작업한 세션에만 말을 건다 — 도구 호출 수로 판정한다(위 상수 주석 참고).
+// 못 재면 종전대로 알린다(모른다고 침묵하면 안전망 자체가 사라진다).
+if (hookInput.transcriptPath && MIN_TOOL_USES > 0) {
   try {
-    const lines = fs
-      .readFileSync(hookInput.transcriptPath, "utf-8")
-      .split(/\r?\n/)
-      .filter((l) => l.trim() !== "").length;
-    if (lines < MIN_TRANSCRIPT_LINES) process.exit(0);
+    const raw = fs.readFileSync(hookInput.transcriptPath, "utf-8");
+    const uses = (raw.match(/"type"\s*:\s*"tool_use"/g) ?? []).length;
+    if (uses < MIN_TOOL_USES) process.exit(0);
   } catch {
     /* 못 읽음 — 게이트를 통과시킨다 */
   }

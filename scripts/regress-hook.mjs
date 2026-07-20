@@ -133,6 +133,33 @@ console.log("2-b) 콜드 스타트 주입");
   );
   const named = run(["--start"], proj);
   check("등록 키가 다르면 그 키로 도구 이름을 만든다", named.out.includes("mcp__my-bigbrain__remember"), named.out.slice(0, 400));
+
+  // **이름에 bigbrain 이 없는 키도 찾아야 한다.** 종전엔 /bigbrain/i 로 키를 걸러서
+  // `bbm`·`memory` 같은 이름으로 등록하면 항목을 통째로 놓쳤다. 그 결과가 특히 나쁘다 —
+  // 볼트는 전역으로 새고, 도구 이름은 존재하지 않는 mcp__bigbrainmemory__* 로 나간다.
+  // 지연 로드 도구는 정확한 이름으로만 부를 수 있으므로, 틀린 이름 광고는 무주입보다 나쁘다.
+  const vOther = makeVault(root, "OTHER", 3);
+  const proj2 = path.join(root, "proj2");
+  fs.mkdirSync(proj2, { recursive: true });
+  fs.writeFileSync(
+    path.join(proj2, ".mcp.json"),
+    JSON.stringify({ mcpServers: { bbm: { env: { BIGBRAIN_VAULT: vOther } } } }),
+    "utf-8",
+  );
+  const odd = run(["--start"], proj2);
+  check("키 이름에 bigbrain 이 없어도 볼트를 찾음", odd.out.includes(vOther.replace(/\\/g, "/")), odd.out.slice(0, 300));
+  check("키 이름에 bigbrain 이 없어도 그 키로 도구 이름 생성", odd.out.includes("mcp__bbm__remember"), odd.out.slice(0, 400));
+
+  // 실행 명령으로도 판별한다(env 를 안 쓰고 인자로 넘기는 등록 방식)
+  const proj3 = path.join(root, "proj3");
+  fs.mkdirSync(proj3, { recursive: true });
+  fs.writeFileSync(
+    path.join(proj3, ".mcp.json"),
+    JSON.stringify({ mcpServers: { memory: { command: "node", args: ["/opt/bigbrainmemory/dist/index.js"] } } }),
+    "utf-8",
+  );
+  const byCmd = run(["--start", "--vault", v], proj3);
+  check("실행 명령으로도 서버를 식별", byCmd.out.includes("mcp__memory__remember"), byCmd.out.slice(0, 400));
 }
 
 // ── 2-c. 기억은 있는데 인덱스를 못 읽는 경우
@@ -252,18 +279,21 @@ console.log("6) 경고 빈도 — Stop 은 매 턴 발화한다");
   // 오해 방지: 종전 문구 "0건입니다 (2건 그대로)" 는 0건과 2건이 동시에 등장해 모순처럼 읽혔다
   check("모순돼 보이던 '0건입니다' 표현 제거", !/0건입니다/.test(spoke[0] ?? ""), spoke[0]?.slice(0, 200));
 
-  // 짧은 대화에는 남길 durable 한 사실이 없다 — 트랜스크립트가 자랄 때까지 기다린다
+  // 잡담 세션에는 남길 durable 한 사실이 없다 — 도구를 실제로 쓴 세션에만 말을 건다.
+  // 줄 수로 재던 종전 방식은 실측 1439개 트랜스크립트에서 진짜 작업 세션의 38%를
+  // 침묵시켰다(4줄짜리 93KB 트랜스크립트가 흔하다 — 줄 수와 작업량은 무관하다).
+  const toolUse = (n) => "{\"type\":\"tool_use\"}\n".repeat(n);
   const v2 = makeVault(root, "N2", 1);
-  const tp = path.join(root, "t-short.jsonl");
-  fs.writeFileSync(tp, "{}\n{}\n{}\n", "utf-8");
+  const tpChat = path.join(root, "t-chat.jsonl");
+  fs.writeFileSync(tpChat, "{}\n".repeat(400), "utf-8"); // 줄은 많지만 도구는 0회
   run(["--start", "--vault-force", v2], root, startEvent({ session_id: "S2", source: "startup" }));
-  const short = run(["--stop", "--vault-force", v2], root, stopEvent({ session_id: "S2", transcript_path: tp }));
-  check("짧은 트랜스크립트에서는 침묵", short.out.trim() === "", short.out.slice(0, 200));
+  const chat = run(["--stop", "--vault-force", v2], root, stopEvent({ session_id: "S2", transcript_path: tpChat }));
+  check("길지만 도구를 안 쓴 잡담 세션에는 침묵", chat.out.trim() === "", chat.out.slice(0, 200));
 
-  const tpLong = path.join(root, "t-long.jsonl");
-  fs.writeFileSync(tpLong, "{}\n".repeat(60), "utf-8");
-  const long = run(["--stop", "--vault-force", v2], root, stopEvent({ session_id: "S2", transcript_path: tpLong }));
-  check("긴 트랜스크립트에서는 경고", /저장된 기억이 없습니다/.test(long.out), long.out.slice(0, 200));
+  const tpWork = path.join(root, "t-work.jsonl");
+  fs.writeFileSync(tpWork, toolUse(4), "utf-8"); // 줄은 4개뿐이지만 실제 작업이다
+  const work = run(["--stop", "--vault-force", v2], root, stopEvent({ session_id: "S2", transcript_path: tpWork }));
+  check("줄 수가 적어도 도구를 썼으면 경고", /저장된 기억이 없습니다/.test(work.out), work.out.slice(0, 200));
 
   // 길이를 모를 때 침묵하면 안전망 자체가 사라진다
   const v3 = makeVault(root, "N3", 1);

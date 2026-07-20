@@ -268,6 +268,27 @@ function fail(message: string) {
   return { content: [{ type: "text" as const, text: message }], isError: true as const };
 }
 
+/**
+ * `remember` / `recall` 을 **지연 로드에서 제외**시키는 표식.
+ *
+ * 왜 필요한가 — 20회 대조 실험이 병목을 특정했다:
+ *   ToolSearch 로 도구를 로드한 회차 16/16 이 전부 저장했다. 저장할지 고민하다
+ *   안 한 경우는 **한 건도 없었다.** 실패는 전부 `remember` 가 존재한다는 사실에
+ *   도달하지 못한 것이었다(훅 ON 10/10 vs OFF 6/10, Fisher 단측 p=0.043).
+ *
+ * 즉 문제는 설득이 아니라 **발견**이다. 지침 문구를 아무리 다듬어도, 도구 이름이
+ * 컨텍스트에 없으면 모델은 ToolSearch 를 부를 이유 자체를 갖지 못한다. 훅 주입이
+ * 효과를 낸 이유도 설득이 아니라 도구 이름을 띄웠기 때문이다.
+ *
+ * 이 두 개만 표시한다. 나머지 6개(revise/forget/link/reflect/read_memory/
+ * list_memories)는 모델이 이미 메모리를 쓰기 시작한 뒤에 필요해지므로 지연 로드로
+ * 충분하고, 전부 올리면 컨텍스트만 축낸다.
+ *
+ * 표식은 MCP 스펙이 보장하는 `_meta` 통과 필드라, 이 키를 모르는 클라이언트는
+ * 그냥 무시한다(하위 호환).
+ */
+const ALWAYS_LOAD = process.env.BIGBRAIN_ALWAYS_LOAD === "0" ? undefined : { "anthropic/alwaysLoad": true };
+
 server.registerTool(
   "remember",
   {
@@ -281,6 +302,7 @@ server.registerTool(
       "This vault is a SEPARATE store from CLAUDE.md, project docs, or built-in file memory, and is reached only through `recall` — a fact written into CLAUDE.md is not retrievable by `recall` from another project, so storing it here is not duplication. " +
       "`confidence` and recall accessibility are independent: `confidence` is how likely the memory is TRUE (changed only via `revise`), while how easily it surfaces is computed from frequency and recency. A rarely-recalled memory can still be highly trusted. " +
       "Memories are stored verbatim and never auto-merged; consolidate only via explicit `revise`.",
+    _meta: ALWAYS_LOAD,
     inputSchema: {
       title: z.string().min(1).describe("Short human-readable title (becomes the note filename)"),
       content: z.string().min(1).describe("The memory body in markdown. May contain [[wikilinks]]"),
@@ -332,6 +354,7 @@ server.registerTool(
       "Results are ranked by relevance x truthfulness(confidence) x base-level activation (power-law of frequency+recency, ACT-R). Competing near-duplicate memories are laterally inhibited in ranking (retrieval-induced forgetting) — see `inhibited`. Associated (linked) memories are surfaced too. Active recall reinforces the recalled memories.\n" +
       // instructions 예산 밖으로 밀려나 전달되지 않던 나이 해석 지침을 여기로 옮겼다.
       "Every result carries `age_days` (days since last update). A memory is a point-in-time observation, not live state: when it cites code, file paths, versions or config and `stale_hint` is present, verify against the current source before asserting it as fact — and `revise` it when reality has moved on.",
+    _meta: ALWAYS_LOAD,
     inputSchema: {
       query: z.string().min(1).describe("Keywords to search for (matched against title, tags, description, body)"),
       type: MEMORY_TYPE.optional(),
