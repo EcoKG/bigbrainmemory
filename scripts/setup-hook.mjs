@@ -33,12 +33,17 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
 
-/** 우리 훅을 식별하는 표식 — 이 문자열로 기존 항목을 찾아 갱신/제거한다 */
-const HOOK_MARKER = "<bigbrainmemory-index>";
-/** Windows: 주입할 최대 줄 수 (컨텍스트 예산 안전장치) */
-const MAX_LINES = 200;
-/** POSIX: 주입할 최대 바이트 수 */
-const MAX_BYTES = 8000;
+/**
+ * 우리 훅을 식별하는 표식 — 이 문자열로 기존 항목을 찾아 갱신/제거한다.
+ * 구버전(셸 one-liner)도 함께 인식해야 재실행 시 깨끗이 교체된다.
+ */
+const HOOK_MARKERS = ["session-guard.mjs", "<bigbrainmemory-index>"];
+/** 실제 로직이 든 스크립트 — 훅은 이 파일을 호출만 한다 */
+const GUARD = path.join(repoRootPlaceholder(), "scripts", "session-guard.mjs");
+function repoRootPlaceholder() {
+  // repoRoot 는 아래에서 정의되므로, 상수 초기화 순서를 피하려고 함수로 감싼다
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+}
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..");
@@ -93,39 +98,75 @@ function resolveVault() {
 }
 
 /**
- * OS별 훅 명령 생성 (함정 1·2).
- * 양쪽 모두 `$` 변수를 쓰지 않는다 — 호스트 셸이 먼저 치환해 버리는 사고를 막는다.
- * 경로는 forward slash 로 통일한다(PowerShell 도 Windows 에서 이를 받아들인다).
+ * 훅 명령 생성 (함정 1·2 해소).
+ *
+ * 셸 문법을 아예 쓰지 않는다 — 로직은 session-guard.mjs 안에 있고, 훅은 그것을
+ * 호출만 한다. 그래서 OS 분기도, 따옴표 이스케이프도, `$` 치환 사고도 없다.
+ * node 는 PATH 대신 **현재 실행 중인 절대 경로**(process.execPath)를 박는다 —
+ * 호스트가 훅을 띄울 때 PATH 가 비어 있을 수 있기 때문이다.
+ * 경로는 forward slash 로 통일해 JSON 백슬래시 이스케이프를 피한다.
  */
-function buildCommand(vaultDir) {
-  const md = `${vaultDir.replace(/\\/g, "/")}/MEMORY.md`;
-  if (process.platform === "win32") {
-    return (
-      `powershell.exe -NoProfile -Command "if (Test-Path '${md}') { ` +
-      `'${HOOK_MARKER}'; Get-Content '${md}' -Encoding utf8 -TotalCount ${MAX_LINES}; ` +
-      `'</bigbrainmemory-index>' }"`
-    );
-  }
-  return (
-    `if [ -f '${md}' ]; then echo '${HOOK_MARKER}'; ` +
-    `head -c ${MAX_BYTES} '${md}'; echo '</bigbrainmemory-index>'; fi`
-  );
+function buildCommands(vaultDir) {
+  const node = process.execPath.replace(/\\/g, "/");
+  const guard = GUARD.replace(/\\/g, "/");
+  const vault = vaultDir.replace(/\\/g, "/");
+  const base = `"${node}" "${guard}"`;
+  return {
+    SessionStart: `${base} --start --vault "${vault}"`,
+    Stop: `${base} --stop --vault "${vault}"`,
+  };
 }
 
 function loadSettings() {
   if (!fs.existsSync(settingsPath)) return {};
-  const raw = fs.readFileSync(settingsPath, "utf-8");
+  // BOM 제거 — Windows 에서 메모장이나 PowerShell 로 settings.json 을 편집하면
+  // BOM 이 붙는데, JSON.parse 는 이를 거부한다. 사용자에게는 멀쩡해 보이는 파일이라
+  // 벗겨주지 않으면 "문법을 고치라" 는 안내가 오히려 혼란만 준다.
+  const raw = fs.readFileSync(settingsPath, "utf-8").replace(/^﻿/, "");
   if (raw.trim() === "") return {};
-  return JSON.parse(raw); // 깨진 JSON 은 여기서 던져 상위에서 안내한다
+  return JSON.parse(raw); // 진짜로 깨진 JSON 은 여기서 던져 상위에서 안내한다
 }
 
-/** SessionStart 배열에서 우리 항목의 인덱스 (없으면 -1) */
+/** 훅 배열에서 우리 항목의 인덱스 (없으면 -1). 구버전 셸 명령도 인식한다 */
 function findOurs(list) {
   return list.findIndex((entry) =>
     (entry?.hooks ?? []).some(
-      (h) => typeof h?.command === "string" && h.command.includes(HOOK_MARKER),
+      (h) =>
+        typeof h?.command === "string" && HOOK_MARKERS.some((m) => h.command.includes(m)),
     ),
   );
+}
+
+/**
+ * 한 훅 이벤트(SessionStart / Stop)에 우리 항목을 반영한다.
+ * 기존 항목이 있으면 제자리 갱신(중복 생성 방지), 없으면 추가.
+ * 반환: { action, otherCount, unchanged }
+ */
+function applyHook(hooks, event, command) {
+  const list = Array.isArray(hooks[event]) ? hooks[event] : [];
+  const idx = findOurs(list);
+  const otherCount = list.length - (idx >= 0 ? 1 : 0);
+  const entry = { hooks: [{ type: "command", command, timeout: 10 }] };
+
+  if (REMOVE) {
+    if (idx < 0) return { action: "없음", otherCount, unchanged: true };
+    list.splice(idx, 1);
+    if (list.length === 0) delete hooks[event];
+    else hooks[event] = list;
+    return { action: "제거", otherCount, unchanged: false };
+  }
+
+  if (idx >= 0) {
+    if (list[idx]?.hooks?.[0]?.command === command) {
+      return { action: "동일", otherCount, unchanged: true };
+    }
+    list[idx] = entry;
+    hooks[event] = list;
+    return { action: "갱신", otherCount, unchanged: false };
+  }
+  list.push(entry);
+  hooks[event] = list;
+  return { action: "추가", otherCount, unchanged: false };
 }
 
 function backup() {
@@ -137,12 +178,11 @@ function backup() {
 }
 
 // ── 본체
-console.log("BigBrainMemory — SessionStart 훅 설치\n");
+console.log(`BigBrainMemory — 세션 훅 ${REMOVE ? "제거" : "설치"}\n`);
 
 const vault = resolveVault();
-const command = buildCommand(vault.dir);
+const commands = buildCommands(vault.dir);
 
-console.log(`플랫폼    : ${process.platform === "win32" ? "Windows (PowerShell)" : "POSIX (sh)"}`);
 console.log(`설정 파일 : ${settingsPath}`);
 console.log(`볼트 경로 : ${vault.dir}`);
 console.log(`  └ 출처  : ${vault.source}`);
@@ -162,54 +202,35 @@ try {
 }
 
 const hooks = settings.hooks && typeof settings.hooks === "object" ? settings.hooks : {};
-const list = Array.isArray(hooks.SessionStart) ? hooks.SessionStart : [];
-const existingIdx = findOurs(list);
-const otherHookCount = list.length - (existingIdx >= 0 ? 1 : 0);
 
-if (REMOVE) {
-  // ── 제거
-  if (existingIdx < 0) {
-    console.log("설치된 BigBrainMemory 훅이 없습니다. 변경할 것이 없습니다.");
-    process.exit(0);
-  }
-  list.splice(existingIdx, 1);
-  if (list.length === 0) delete hooks.SessionStart;
-  else hooks.SessionStart = list;
-  if (Object.keys(hooks).length === 0) delete settings.hooks;
-  else settings.hooks = hooks;
+// SessionStart(회상) 와 Stop(무저장 감지) 을 한 벌로 다룬다 — 둘은 마커 파일로 짝을 이룬다
+const results = {
+  SessionStart: applyHook(hooks, "SessionStart", commands.SessionStart),
+  Stop: applyHook(hooks, "Stop", commands.Stop),
+};
+if (Object.keys(hooks).length === 0) delete settings.hooks;
+else settings.hooks = hooks;
 
-  console.log("제거할 항목을 찾았습니다.");
-  if (DRY_RUN) {
-    console.log("\n--dry-run 이므로 아무것도 쓰지 않았습니다.");
-    process.exit(0);
-  }
-  const bak = backup();
-  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
-  console.log(`백업      : ${bak}`);
-  console.log("✔ 훅을 제거했습니다. Claude 를 재시작하면 반영됩니다.");
+for (const [event, r] of Object.entries(results)) {
+  console.log(`${event.padEnd(13)}: ${r.action} (기존 다른 항목 ${r.otherCount}개 보존)`);
+}
+
+if (Object.values(results).every((r) => r.unchanged)) {
+  console.log(
+    REMOVE
+      ? "\n설치된 BigBrainMemory 훅이 없습니다. 변경할 것이 없습니다."
+      : "\n이미 동일한 설정으로 설치돼 있습니다. 변경할 것이 없습니다." +
+          "\n(볼트 경로를 바꿨다면 --vault 로 지정해 다시 실행하세요.)",
+  );
   process.exit(0);
 }
 
-// ── 설치 / 갱신
-const entry = { hooks: [{ type: "command", command, timeout: 5 }] };
-const action = existingIdx >= 0 ? "갱신" : "추가";
-if (existingIdx >= 0) {
-  const before = list[existingIdx]?.hooks?.[0]?.command;
-  if (before === command) {
-    console.log("이미 동일한 설정으로 설치돼 있습니다. 변경할 것이 없습니다.");
-    console.log("(볼트 경로를 바꿨다면 --vault 로 지정해 다시 실행하세요.)");
-    process.exit(0);
-  }
-  list[existingIdx] = entry; // 경로/OS 가 바뀐 경우 제자리 갱신 — 중복 생성 방지
-} else {
-  list.push(entry);
+if (!REMOVE) {
+  console.log(`\n등록할 명령:`);
+  console.log(`  SessionStart : ${commands.SessionStart}`);
+  console.log(`  Stop         : ${commands.Stop}`);
 }
-hooks.SessionStart = list;
-settings.hooks = hooks;
-
-console.log(`동작      : SessionStart 훅 ${action}`);
-console.log(`보존      : 기존 SessionStart 항목 ${otherHookCount}개, 그 외 설정 전부 유지`);
-console.log(`\n등록할 명령:\n  ${command}\n`);
+console.log("");
 
 if (DRY_RUN) {
   console.log("--dry-run 이므로 아무것도 쓰지 않았습니다.");
@@ -217,18 +238,19 @@ if (DRY_RUN) {
 }
 
 // 실제 동작하는 명령인지 먼저 확인 — 못 도는 명령을 설정에 남기지 않는다
-console.log("명령 자체 검증:");
-try {
-  const out = execSync(command, { encoding: "utf-8", timeout: 15000, stdio: ["ignore", "pipe", "pipe"] });
-  if (out.includes(HOOK_MARKER)) {
-    console.log(`  ✔ 정상 실행 — ${out.split(/\r?\n/).filter(Boolean).length}줄 주입 예정`);
-  } else if (!fs.existsSync(path.join(vault.dir, "MEMORY.md"))) {
-    console.log("  ✔ 정상 실행 — MEMORY.md 가 아직 없어 출력이 비어 있습니다(정상)");
-  } else {
-    fail("실행은 됐으나 예상한 표식이 출력되지 않았습니다");
+if (!REMOVE) {
+  console.log("명령 자체 검증:");
+  if (!fs.existsSync(GUARD)) {
+    fail(`훅 본체를 찾을 수 없습니다: ${GUARD}`);
   }
-} catch (err) {
-  fail(`실행 실패: ${err instanceof Error ? err.message : String(err)}`);
+  for (const [event, cmd] of Object.entries(commands)) {
+    try {
+      execSync(cmd, { encoding: "utf-8", timeout: 15000, stdio: ["ignore", "pipe", "pipe"] });
+      console.log(`  ✔ ${event} 정상 실행`);
+    } catch (err) {
+      fail(`${event} 실행 실패: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 }
 
 if (failed) {
@@ -253,6 +275,12 @@ try {
 }
 
 console.log(`\n백업      : ${bak ?? "(기존 파일 없음 — 새로 생성)"}`);
-console.log(`✔ 설치 완료: ${settingsPath}`);
-console.log("\n다음 단계: Claude 를 재시작하면 매 세션 시작 시 MEMORY.md 가 주입됩니다.");
-console.log("되돌리려면: npm run setup:hook -- --remove");
+console.log(`✔ ${REMOVE ? "제거" : "설치"} 완료: ${settingsPath}`);
+if (!REMOVE) {
+  console.log("\n다음 단계: Claude 를 재시작하면");
+  console.log("  · SessionStart — 매 세션 시작 시 MEMORY.md 를 주입합니다(회상).");
+  console.log("  · Stop         — 세션에서 새로 저장된 기억이 0건이면 경고합니다(무저장 감지).");
+  console.log("되돌리려면: npm run setup:hook -- --remove");
+} else {
+  console.log("Claude 를 재시작하면 반영됩니다.");
+}
