@@ -54,6 +54,35 @@ function vaultFromServers(servers) {
   return null;
 }
 
+/** mcpServers 맵에서 bigbrain 계열 서버의 **등록 키 이름** 을 찾는다 */
+function serverNameFromServers(servers) {
+  if (!servers || typeof servers !== "object") return null;
+  for (const name of Object.keys(servers)) if (/bigbrain/i.test(name)) return name;
+  return null;
+}
+
+/**
+ * 주입문에 박을 MCP 도구 이름의 서버 키를 해석한다 (`mcp__<서버키>__remember`).
+ *
+ * 왜 이름을 박아야 하는가:
+ *   클라이언트가 MCP 도구를 **지연 로드(deferred)** 하면 스키마가 컨텍스트에 없어서,
+ *   모델은 도구를 "쓸지 말지" 판단하기 전에 먼저 이름으로 지목해 불러와야 한다.
+ *   "기억하세요" 라고만 쓰면 무엇을 로드해야 하는지 알 수 없다. 관측된 콜드 스타트
+ *   실패에서 모델은 저장을 판단하고 안 한 게 아니라 **도구 탐색 자체를 하지 않았다.**
+ *   등록 키는 사용자마다 다를 수 있으므로 설정에서 실제 값을 찾아 쓴다.
+ */
+function resolveServerName() {
+  const cwd = process.cwd();
+  const fromProject = serverNameFromServers(readJson(path.join(cwd, ".mcp.json"))?.mcpServers);
+  if (fromProject) return fromProject;
+  const userCfg = readJson(path.join(os.homedir(), ".claude.json"));
+  return (
+    serverNameFromServers(userCfg?.projects?.[cwd]?.mcpServers) ??
+    serverNameFromServers(userCfg?.mcpServers) ??
+    "bigbrainmemory"
+  );
+}
+
 /**
  * **실행 시점**에 볼트를 해석한다 — 이것이 이 스크립트의 핵심이다.
  *
@@ -111,33 +140,71 @@ function countMemories() {
 }
 
 if (mode === "start") {
+  const count = countMemories();
+
   // 1) 비교 기준 기록. 볼트가 아직 없으면 쓸 수 없으므로 조용히 넘어간다.
   try {
-    fs.writeFileSync(markerPath, String(countMemories()), "utf-8");
+    fs.writeFileSync(markerPath, String(count), "utf-8");
   } catch {
     /* 볼트 미생성 등 — 무시 */
   }
 
-  // 2) MEMORY.md 주입 (회상 트리거 채널 ②). 아직 없으면 아무것도 내보내지 않는다.
+  // 볼트 디렉터리 자체가 없으면 침묵한다. 이건 콜드 스타트가 아니라 **설정이 어긋난**
+  // 상태이고(경로 오타, 아직 이 프로젝트에 붙이지 않음), 그걸 매 세션 떠들면 노이즈다.
+  if (!fs.existsSync(vaultDir)) process.exit(0);
+
+  const attrs = `vault="${vaultDir.replace(/\\/g, "/")}" memories="${count}"`;
+  // 지연 로드된 도구는 정확한 이름으로만 불러올 수 있다 — 이름을 그대로 노출한다.
+  const tool = (n) => `mcp__${resolveServerName()}__${n}`;
+  const toolLines =
+    `Load these by name when you need them (they may be lazily loaded and thus invisible until asked for):\n` +
+    `  ${tool("recall")}   — search memory before answering from assumption\n` +
+    `  ${tool("remember")} — store a durable fact, decision, preference, or lesson\n`;
+
+  // 2) 볼트 상태 주입 (회상 트리거 채널 ②).
+  //
+  // 콜드 스타트에도 **반드시** 주입한다. 예전에는 MEMORY.md 본문이 비면 침묵했는데,
+  // 그 침묵이 자기강화 루프를 만들었다: 볼트가 비어 있음 → 주입할 인덱스가 없음 →
+  // 모델이 메모리의 존재를 인지 못 함 → 저장 0건 → 다음 세션도 비어 있음.
+  // 대조 실험에서 이 루프가 실증됐다. 서버 instructions 의 COLD START 문구는 두 세션
+  // 모두 온전히(1842자, 무절단) 도착했는데도 행동을 만들지 못했고, 갈린 변수는
+  // **훅이 컨텍스트에 무언가를 넣었는가** 하나뿐이었다. 즉 instructions 만으로는
+  // 부족하고 이 주입이 실제 트리거다.
+  if (count === 0) {
+    process.stdout.write(
+      `<bigbrainmemory-index ${attrs}>\n` +
+        `COLD START — this vault holds 0 memories. That is expected on a fresh vault and is NOT ` +
+        `evidence that memory is unneeded; it means seeding the vault is part of this session's job.\n` +
+        toolLines +
+        `Call remember the moment a trigger fires — a decision settles, the user states a preference ` +
+        `or corrects you, you find a non-obvious root cause — not at the end of the session.\n` +
+        `</bigbrainmemory-index>\n`,
+    );
+    process.exit(0);
+  }
+
+  let body = "";
   try {
     // BOM 제거 — 주입되는 컨텍스트 첫머리에 보이지 않는 문자가 섞이지 않게 한다
     const md = fs.readFileSync(path.join(vaultDir, "MEMORY.md"), "utf-8").replace(/^﻿/, "");
-    const body = md.split(/\r?\n/).slice(0, MAX_LINES).join("\n").trimEnd();
-    if (body !== "") {
-      // 출처(볼트 경로·건수)를 함께 밝힌다 — 서버가 다른 볼트를 보고 있으면
-      // "인덱스엔 기억이 있는데 서버는 EMPTY" 라는 모순이 눈에 보여야 한다.
-      // 밝히지 않으면 모델은 인덱스만 보고 "메모리가 잘 돌고 있다" 고 오판한다.
-      const attrs = `vault="${vaultDir.replace(/\\/g, "/")}" memories="${countMemories()}"`;
-      process.stdout.write(
-        `<bigbrainmemory-index ${attrs}>\n${body}\n</bigbrainmemory-index>\n` +
-          `(This index was injected by a SessionStart hook reading the vault above. ` +
-          `If the bigbrainmemory server reports a different vault or says the vault is EMPTY, ` +
-          `the two are pointing at different paths — trust the server's tools, and tell the user about the mismatch.)\n`,
-      );
-    }
+    body = md.split(/\r?\n/).slice(0, MAX_LINES).join("\n").trimEnd();
   } catch {
-    /* MEMORY.md 없음 — 콜드 스타트. 서버 instructions 가 그 상황을 따로 안내한다 */
+    /* 인덱스 파일이 없거나 못 읽음 — 아래에서 건수만으로 대체한다 */
   }
+  // 기억이 있는데 인덱스를 못 읽었다면 침묵이 아니라 건수라도 알린다.
+  // 여기서 침묵하면 "기억이 있는 볼트" 가 "빈 볼트" 와 구분되지 않는다.
+  if (body === "") body = `(index unavailable — ${count} memories are stored; use recall to reach them)`;
+
+  // 출처(볼트 경로·건수)를 함께 밝힌다 — 서버가 다른 볼트를 보고 있으면
+  // "인덱스엔 기억이 있는데 서버는 EMPTY" 라는 모순이 눈에 보여야 한다.
+  // 밝히지 않으면 모델은 인덱스만 보고 "메모리가 잘 돌고 있다" 고 오판한다.
+  process.stdout.write(
+    `<bigbrainmemory-index ${attrs}>\n${body}\n</bigbrainmemory-index>\n` +
+      toolLines +
+      `(This index was injected by a SessionStart hook reading the vault above. ` +
+      `If the bigbrainmemory server reports a different vault or says the vault is EMPTY, ` +
+      `the two are pointing at different paths — trust the server's tools, and tell the user about the mismatch.)\n`,
+  );
   process.exit(0);
 }
 

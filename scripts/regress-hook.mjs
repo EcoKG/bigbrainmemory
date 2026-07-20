@@ -97,6 +97,51 @@ console.log("2) 주입 블록의 출처 표기");
   check("인덱스 본문 포함", out.includes("# 인덱스 V"));
 }
 
+// ── 2-b. 콜드 스타트에도 주입한다 (H4)
+//
+// 고정하는 버그: 예전에는 MEMORY.md 본문이 비면 침묵했다. 그 침묵이 자기강화 루프를
+// 만들었다 — 볼트가 빔 → 주입 없음 → 모델이 메모리 존재를 인지 못 함 → 저장 0건 →
+// 다음 세션도 빔. 대조 실험에서 서버 instructions 의 COLD START 문구는 양쪽 세션 모두
+// 온전히 도착했는데도, 훅 주입이 있던 쪽만 도구를 호출했다.
+console.log("2-b) 콜드 스타트 주입");
+{
+  const root = freshDir("cold");
+  const v = makeVault(root, "C", 0); // 기억 0건 — MEMORY.md 는 헤더만 있다
+  const { out, code } = run(["--start", "--vault-force", v], root);
+  check("빈 볼트에서도 침묵하지 않음", out.trim() !== "", `out=${JSON.stringify(out)}`);
+  check("콜드 스타트임을 명시", /COLD START/.test(out), out.slice(0, 200));
+  check("건수 0 을 표기", out.includes('memories="0"'), out.slice(0, 200));
+  check("'비었으니 메모리가 불필요' 라는 오독을 차단", /NOT\s+evidence that memory is unneeded/.test(out));
+  // 지연 로드(deferred)된 도구는 정확한 이름을 알아야 불러올 수 있다
+  check("remember 도구 이름을 그대로 노출", /mcp__[A-Za-z0-9_-]*bigbrain[A-Za-z0-9_-]*__remember/i.test(out), out.slice(0, 400));
+  check("recall 도구 이름도 노출", /mcp__[A-Za-z0-9_-]*bigbrain[A-Za-z0-9_-]*__recall/i.test(out));
+  check("저장 시점(세션 끝이 아님)을 지시", /not at the end of the session/.test(out));
+  check("종료코드 0", code === 0);
+
+  // 설정에 등록된 실제 서버 키를 따라간다 — 키 이름은 사용자마다 다르다
+  const proj = path.join(root, "proj");
+  fs.mkdirSync(proj, { recursive: true });
+  fs.writeFileSync(
+    path.join(proj, ".mcp.json"),
+    JSON.stringify({ mcpServers: { "my-bigbrain": { env: { BIGBRAIN_VAULT: v } } } }),
+    "utf-8",
+  );
+  const named = run(["--start"], proj);
+  check("등록 키가 다르면 그 키로 도구 이름을 만든다", named.out.includes("mcp__my-bigbrain__remember"), named.out.slice(0, 400));
+}
+
+// ── 2-c. 기억은 있는데 인덱스를 못 읽는 경우
+console.log("2-c) MEMORY.md 손실 — 건수라도 알린다");
+{
+  const root = freshDir("noindex");
+  const v = makeVault(root, "N", 2);
+  fs.unlinkSync(path.join(v, "MEMORY.md")); // 인덱스만 유실
+  const { out } = run(["--start", "--vault-force", v], root);
+  check("침묵하지 않음(빈 볼트와 혼동 금지)", out.trim() !== "", `out=${JSON.stringify(out)}`);
+  check("건수 2 를 알림", out.includes('memories="2"') && /2 memories are stored/.test(out), out.slice(0, 300));
+  check("콜드 스타트로 오인하지 않음", !/COLD START/.test(out));
+}
+
 // ── 3. 무저장 감지 (Stop)
 console.log("3) 무저장 감지");
 {
