@@ -89,7 +89,11 @@ console.log("2) 캐시 무효화 정확성");
 
   // 파일을 직접 지우면 null
   const c = new MemoryStore(new Vault(dir));
-  fs.rmSync(path.join(dir, "archive", `${r1.slug}.md`));
+  // unlinkSync 를 쓴다(rmSync 아님) — Node v24.13.0(win32) 은 **비ASCII 경로에 단일 파일**
+  // fs.rmSync 를 호출하면 JS 예외 없이 프로세스가 즉사한다(0xC0000409 fail-fast).
+  // 이 볼트의 슬러그는 한글이라 정확히 그 경로를 밟아 테스트가 통째로 죽었다.
+  // 디렉터리 재귀 삭제({recursive:true})는 다른 코드 경로라 영향 없다.
+  fs.unlinkSync(path.join(dir, "archive", `${r1.slug}.md`));
   check("삭제된 기억은 null", c.resolve(r1.id) === null);
 }
 
