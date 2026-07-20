@@ -48,19 +48,24 @@ function makeVault(root, label, n) {
   return v;
 }
 
-/** guard 실행 — { out, code } */
-function run(args, cwd) {
+/** guard 실행 — { out, code }. input 은 훅이 stdin 으로 받는 이벤트 JSON. */
+function run(args, cwd, input = "") {
   try {
     const out = execFileSync(process.execPath, [guard, ...args], {
       cwd,
       encoding: "utf-8",
       timeout: 15000,
+      input,
     });
     return { out, code: 0 };
   } catch (err) {
     return { out: err.stdout ?? "", code: err.status ?? -1 };
   }
 }
+const startEvent = (o = {}) => JSON.stringify({ hook_event_name: "SessionStart", ...o });
+const stopEvent = (o = {}) => JSON.stringify({ hook_event_name: "Stop", ...o });
+const readMarkerRaw = (v) => fs.readFileSync(path.join(v, ".bbm-session-start"), "utf-8").trim();
+const addMemory = (v, n) => fs.writeFileSync(path.join(v, "memories", `${n}.md`), "x", "utf-8");
 
 // ── 1. 실행 시점 볼트 해석 (H1)
 console.log("1) 실행 시점 볼트 해석 — 프로젝트 설정을 따라간다");
@@ -150,10 +155,11 @@ console.log("3) 무저장 감지");
 
   const start = run(["--start", "--vault-force", v], root);
   check("start 종료코드 0", start.code === 0);
-  check("마커 기록됨", fs.readFileSync(path.join(v, ".bbm-session-start"), "utf-8").trim() === "1");
+  // 마커는 JSON 이다 — session_id 를 함께 담아야 재개·압축과 새 세션을 구분할 수 있다
+  check("마커에 기준 건수 기록됨", JSON.parse(readMarkerRaw(v)).count === 1, readMarkerRaw(v));
 
   const noSave = run(["--stop", "--vault-force", v], root);
-  check("저장 0건이면 경고", /0건입니다/.test(noSave.out), noSave.out.slice(0, 200));
+  check("저장 0건이면 경고", /저장된 기억이 없습니다/.test(noSave.out), noSave.out.slice(0, 200));
   check("경고해도 종료코드 0 (세션을 막지 않음)", noSave.code === 0);
 
   fs.writeFileSync(path.join(v, "memories", "새기억.md"), "z", "utf-8");
@@ -178,6 +184,117 @@ console.log("4) 실패 시 침묵 + 종료코드 0");
 
   const noArgs = run(["--start"], root);
   check("볼트 인자 자체가 없어도 종료코드 0", noArgs.code === 0);
+}
+
+// ── 5. 마커 생명주기 (H5)
+//
+// 고정하는 버그: SessionStart 는 세션당 한 번이 아니라 startup/resume/clear/compact
+// 각각에 발화한다. 종전처럼 매번 현재 건수를 덮어쓰면 세션 중간의 컨텍스트 압축이
+// 기준선을 리셋해, 그 전에 저장한 기억이 없던 일이 되고 종료 시 오탐 경고가 난다.
+// 재현: startup(0) → 2건 저장 → compact(기준선 2로 리셋) → 종료 시 "0건" 경고.
+console.log("5) 마커 생명주기 — 재개·압축이 기준선을 지운다");
+{
+  const root = freshDir("marker");
+
+  // 5-1. 같은 session_id 면 기준선을 보존한다
+  const v1 = makeVault(root, "M1", 0);
+  run(["--start", "--vault-force", v1], root, startEvent({ session_id: "S1", source: "startup" }));
+  addMemory(v1, "a");
+  addMemory(v1, "b");
+  run(["--start", "--vault-force", v1], root, startEvent({ session_id: "S1", source: "compact" }));
+  check("compact 후에도 기준선이 0 으로 보존됨", JSON.parse(readMarkerRaw(v1)).count === 0, readMarkerRaw(v1));
+  const afterCompact = run(["--stop", "--vault-force", v1], root, stopEvent({ session_id: "S1" }));
+  check("압축 전 저장분이 인정돼 침묵함(오탐 없음)", afterCompact.out.trim() === "", afterCompact.out.slice(0, 200));
+
+  // 5-2. session_id 를 못 받아도 source 로 이어지는 세션을 알아본다
+  const v2 = makeVault(root, "M2", 0);
+  run(["--start", "--vault-force", v2], root, startEvent({ source: "startup" }));
+  addMemory(v2, "a");
+  run(["--start", "--vault-force", v2], root, startEvent({ source: "resume" }));
+  check("session_id 없어도 resume 이면 기준선 보존", JSON.parse(readMarkerRaw(v2)).count === 0, readMarkerRaw(v2));
+
+  // 5-3. 진짜 새 세션이면 기준선을 갱신해야 한다(안 하면 영원히 침묵)
+  const v3 = makeVault(root, "M3", 0);
+  run(["--start", "--vault-force", v3], root, startEvent({ session_id: "S1", source: "startup" }));
+  addMemory(v3, "a");
+  run(["--start", "--vault-force", v3], root, startEvent({ session_id: "S2", source: "startup" }));
+  check("다른 session_id 면 기준선 갱신(1건)", JSON.parse(readMarkerRaw(v3)).count === 1, readMarkerRaw(v3));
+
+  // 5-4. 다른 세션의 Stop 은 비교가 성립하지 않으므로 침묵
+  const cross = run(["--stop", "--vault-force", v3], root, stopEvent({ session_id: "S1" }));
+  check("마커를 남긴 세션과 다르면 stop 침묵", cross.out.trim() === "", cross.out.slice(0, 200));
+
+  // 5-5. 구형(숫자만) 마커 하위 호환 — 업그레이드해도 경고가 깨지지 않아야 한다
+  const v4 = makeVault(root, "M4", 2);
+  fs.writeFileSync(path.join(v4, ".bbm-session-start"), "2", "utf-8");
+  const legacy = run(["--stop", "--vault-force", v4], root, stopEvent({ session_id: "S9" }));
+  check("구형 숫자 마커도 해석해 경고", /저장된 기억이 없습니다/.test(legacy.out), legacy.out.slice(0, 200));
+}
+
+// ── 6. 경고 빈도 (H6)
+//
+// 고정하는 버그: Stop 은 세션 종료가 아니라 **매 턴**(Claude 가 응답을 마칠 때마다)
+// 발화한다. 그대로 두면 저장 전까지 모든 응답에 같은 경고가 붙어, 정작 봐야 할
+// 신호가 소음에 묻힌다(경보 피로).
+console.log("6) 경고 빈도 — Stop 은 매 턴 발화한다");
+{
+  const root = freshDir("nag");
+  const v = makeVault(root, "N", 1);
+  run(["--start", "--vault-force", v], root, startEvent({ session_id: "S1", source: "startup" }));
+  const turns = [];
+  for (let turn = 0; turn < 5; turn++) {
+    turns.push(run(["--stop", "--vault-force", v], root, stopEvent({ session_id: "S1" })).out.trim());
+  }
+  const spoke = turns.filter((t) => t !== "");
+  check("5턴 동안 경고는 1회뿐", spoke.length === 1, `발화 ${spoke.length}회`);
+  check("경고는 첫 턴에 나온다", turns[0] !== "", `turns=${JSON.stringify(turns.map((t) => t !== ""))}`);
+  check("세션당 1회임을 문구로 밝힘", /세션당 한 번만/.test(spoke[0] ?? ""), spoke[0]?.slice(0, 200));
+  // 오해 방지: 종전 문구 "0건입니다 (2건 그대로)" 는 0건과 2건이 동시에 등장해 모순처럼 읽혔다
+  check("모순돼 보이던 '0건입니다' 표현 제거", !/0건입니다/.test(spoke[0] ?? ""), spoke[0]?.slice(0, 200));
+
+  // 짧은 대화에는 남길 durable 한 사실이 없다 — 트랜스크립트가 자랄 때까지 기다린다
+  const v2 = makeVault(root, "N2", 1);
+  const tp = path.join(root, "t-short.jsonl");
+  fs.writeFileSync(tp, "{}\n{}\n{}\n", "utf-8");
+  run(["--start", "--vault-force", v2], root, startEvent({ session_id: "S2", source: "startup" }));
+  const short = run(["--stop", "--vault-force", v2], root, stopEvent({ session_id: "S2", transcript_path: tp }));
+  check("짧은 트랜스크립트에서는 침묵", short.out.trim() === "", short.out.slice(0, 200));
+
+  const tpLong = path.join(root, "t-long.jsonl");
+  fs.writeFileSync(tpLong, "{}\n".repeat(60), "utf-8");
+  const long = run(["--stop", "--vault-force", v2], root, stopEvent({ session_id: "S2", transcript_path: tpLong }));
+  check("긴 트랜스크립트에서는 경고", /저장된 기억이 없습니다/.test(long.out), long.out.slice(0, 200));
+
+  // 길이를 모를 때 침묵하면 안전망 자체가 사라진다
+  const v3 = makeVault(root, "N3", 1);
+  run(["--start", "--vault-force", v3], root, startEvent({ session_id: "S3", source: "startup" }));
+  const unknown = run(["--stop", "--vault-force", v3], root, stopEvent({ session_id: "S3" }));
+  check("트랜스크립트 경로를 모르면 종전대로 경고", /저장된 기억이 없습니다/.test(unknown.out), unknown.out.slice(0, 200));
+
+  const v4 = makeVault(root, "N4", 1);
+  run(["--start", "--vault-force", v4], root, startEvent({ session_id: "S4", source: "startup" }));
+  const gone = run(["--stop", "--vault-force", v4], root, stopEvent({ session_id: "S4", transcript_path: path.join(root, "없음.jsonl") }));
+  check("트랜스크립트가 없어도 경고(게이트 통과)", /저장된 기억이 없습니다/.test(gone.out), gone.out.slice(0, 200));
+}
+
+// ── 7. stdin 이 없거나 깨져도 멈추지 않는다 (H7)
+//
+// Stop 은 매 턴 실행되므로 한 번의 지연이 대화 전체에 곱해진다. stdin 이 닫히지 않는
+// 파이프로 상속돼도 훅은 반드시 즉시 끝나야 한다.
+console.log("7) stdin 부재·불량 내성");
+{
+  const root = freshDir("stdin");
+  const v = makeVault(root, "I", 2);
+  const t0 = Date.now();
+  const noStdin = run(["--start", "--vault-force", v], root);
+  const elapsed = Date.now() - t0;
+  check("stdin 없이도 즉시 종료(5초 미만)", elapsed < 5000, `${elapsed}ms`);
+  check("stdin 없이도 주입은 정상", noStdin.out.includes('memories="2"'), noStdin.out.slice(0, 200));
+  check("stdin 없이도 종료코드 0", noStdin.code === 0);
+
+  const junk = run(["--start", "--vault-force", v], root, "이건 JSON 이 아닙니다{{{");
+  check("깨진 stdin 이어도 종료코드 0", junk.code === 0);
+  check("깨진 stdin 이어도 주입은 정상", junk.out.includes("bigbrainmemory-index"), junk.out.slice(0, 200));
 }
 
 for (const d of cleanups) fs.rmSync(d, { recursive: true, force: true });

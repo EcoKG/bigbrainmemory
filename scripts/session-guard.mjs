@@ -22,6 +22,17 @@ import path from "node:path";
 const MARKER = ".bbm-session-start";
 /** 주입할 MEMORY.md 최대 줄 수 — 볼트가 커져도 컨텍스트 예산을 넘지 않게 하는 안전장치 */
 const MAX_LINES = 200;
+/**
+ * 이 줄 수보다 짧은 트랜스크립트에서는 무저장 경고를 띄우지 않는다.
+ * Stop 은 **매 턴** 발화하므로, 첫 턴부터 "저장할 게 없느냐" 고 묻는 건 소음이다.
+ * 한두 마디 묻고 끝나는 대화에는 애초에 남길 durable 한 사실이 없다.
+ */
+const MIN_TRANSCRIPT_LINES = (() => {
+  const v = Number(process.env.BIGBRAIN_STOP_MIN_LINES);
+  return Number.isFinite(v) && v >= 0 ? v : 25;
+})();
+/** 훅 입력(stdin) 을 기다리는 한계 시간 — 넘기면 없는 셈 치고 진행한다(행 방지) */
+const STDIN_TIMEOUT_MS = 250;
 
 const argv = process.argv.slice(2);
 const mode = argv.includes("--stop") ? "stop" : "start";
@@ -139,15 +150,108 @@ function countMemories() {
   }
 }
 
-if (mode === "start") {
-  const count = countMemories();
-
-  // 1) 비교 기준 기록. 볼트가 아직 없으면 쓸 수 없으므로 조용히 넘어간다.
+/**
+ * 훅 입력 JSON 을 stdin 에서 읽는다 — `session_id`, `source`, `transcript_path` 가 온다.
+ *
+ * **절대 멈추면 안 된다.** stdin 이 닫히지 않는 파이프로 상속될 수 있고, Stop 훅은 매 턴
+ * 실행되므로 한 번의 지연이 대화 전체에 곱해진다. 그래서 타임아웃을 두고, 넘으면
+ * 입력이 없는 셈 치고 진행한다(그 경우 종전 동작으로 자연히 퇴화한다).
+ */
+async function readHookInput() {
+  const empty = { sessionId: null, source: null, transcriptPath: null };
+  if (process.stdin.isTTY) return empty;
+  const raw = await new Promise((resolve) => {
+    let buf = "";
+    let settled = false;
+    const done = (v) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        process.stdin.pause();
+      } catch {
+        /* 무시 */
+      }
+      resolve(v);
+    };
+    const timer = setTimeout(() => done(buf), STDIN_TIMEOUT_MS);
+    try {
+      process.stdin.setEncoding("utf-8");
+      process.stdin.on("data", (c) => (buf += c));
+      process.stdin.on("end", () => done(buf));
+      process.stdin.on("error", () => done(""));
+    } catch {
+      done("");
+    }
+  });
   try {
-    fs.writeFileSync(markerPath, String(count), "utf-8");
+    const o = JSON.parse(raw);
+    return {
+      sessionId: typeof o?.session_id === "string" ? o.session_id : null,
+      source: typeof o?.source === "string" ? o.source : null,
+      transcriptPath: typeof o?.transcript_path === "string" ? o.transcript_path : null,
+    };
+  } catch {
+    return empty;
+  }
+}
+
+/**
+ * 마커 읽기. 신형은 JSON, 구형은 숫자 하나 — 둘 다 받는다.
+ * (구형 마커를 남긴 채 업그레이드해도 경고가 깨지지 않아야 한다)
+ */
+function readMarker() {
+  let raw;
+  try {
+    raw = fs.readFileSync(markerPath, "utf-8").replace(/^﻿/, "").trim();
+  } catch {
+    return null;
+  }
+  if (raw === "") return null;
+  try {
+    const o = JSON.parse(raw);
+    if (o && typeof o === "object") {
+      return {
+        sessionId: typeof o.sessionId === "string" ? o.sessionId : null,
+        count: Number.isFinite(o.count) ? o.count : Number.NaN,
+        warned: o.warned === true,
+      };
+    }
+  } catch {
+    /* 구형 포맷 — 아래에서 숫자로 해석 */
+  }
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) ? { sessionId: null, count: n, warned: false } : null;
+}
+
+function writeMarker(m) {
+  try {
+    fs.writeFileSync(markerPath, JSON.stringify(m), "utf-8");
   } catch {
     /* 볼트 미생성 등 — 무시 */
   }
+}
+
+const hookInput = await readHookInput();
+
+if (mode === "start") {
+  const count = countMemories();
+
+  // 1) 비교 기준 기록.
+  //
+  // **매번 덮어쓰면 안 된다.** SessionStart 는 세션당 한 번이 아니라 startup/resume/
+  // clear/compact 네 경우에 각각 발화한다. 종전처럼 무조건 현재 건수를 써버리면,
+  // 세션 중간에 컨텍스트가 압축될 때 기준선이 "그때까지 저장한 만큼" 으로 리셋되고,
+  // 그 전에 성실히 저장한 기억이 통째로 없던 일이 된다 → 종료 시 오탐 경고.
+  // 재현: startup(0) → 2건 저장 → compact(기준선 2) → 종료 시 "0건" 경고.
+  // 그래서 session_id 가 같으면 기존 기준선을 **보존**한다.
+  const prev = readMarker();
+  const sameSession =
+    hookInput.sessionId && prev?.sessionId
+      ? hookInput.sessionId === prev.sessionId
+      : // session_id 를 못 받았을 때의 차선책 — 재개/압축은 이어지는 세션으로 본다
+        !!prev && (hookInput.source === "resume" || hookInput.source === "compact");
+  if (!sameSession) writeMarker({ sessionId: hookInput.sessionId, count, warned: false });
 
   // 볼트 디렉터리 자체가 없으면 침묵한다. 이건 콜드 스타트가 아니라 **설정이 어긋난**
   // 상태이고(경로 오타, 아직 이 프로젝트에 붙이지 않음), 그걸 매 세션 떠들면 노이즈다.
@@ -214,22 +318,40 @@ if (mode === "start") {
 //   mtime 비교(-newer)를 쓰면 recall 의 강화 쓰기까지 "저장됨" 으로 잡혀,
 //   정작 잡아야 할 무저장 세션이 조용히 통과한다(거짓 음성).
 //   remember 로 새 노트가 생겼는지만 보는 편이 목적에 정확하다.
-let before = Number.NaN;
-try {
-  before = Number.parseInt(fs.readFileSync(markerPath, "utf-8").trim(), 10);
-} catch {
-  /* 마커 없음 — SessionStart 훅이 안 걸렸거나 볼트가 없다 */
-}
+const m = readMarker();
 
 // 비교 기준이 없으면 침묵한다 — 근거 없는 경고는 노이즈일 뿐이다
-if (!Number.isFinite(before)) process.exit(0);
+if (!m || !Number.isFinite(m.count)) process.exit(0);
 
-const after = countMemories();
-if (after > before) process.exit(0); // 저장됐다 — 조용히 통과
+// 마커를 남긴 세션과 지금 끝나는 세션이 다르면 비교가 성립하지 않는다.
+// (여러 세션이 한 볼트를 공유하면 마커는 마지막 SessionStart 것이다)
+if (hookInput.sessionId && m.sessionId && hookInput.sessionId !== m.sessionId) process.exit(0);
 
+if (countMemories() > m.count) process.exit(0); // 저장됐다 — 조용히 통과
+
+// **Stop 은 세션 끝이 아니라 매 턴 발화한다.** 그대로 두면 저장 전까지 모든 응답마다
+// 같은 경고가 반복돼, 정작 봐야 할 신호가 소음에 묻힌다(경보 피로).
+// 그래서 세션당 한 번만 알린다.
+if (m.warned) process.exit(0);
+
+// 짧은 대화에는 애초에 남길 durable 한 사실이 없다 — 트랜스크립트가 자랄 때까지 기다린다.
+// 길이를 못 재면 종전대로 알린다(모른다고 침묵하면 안전망이 사라진다).
+if (hookInput.transcriptPath && MIN_TRANSCRIPT_LINES > 0) {
+  try {
+    const lines = fs
+      .readFileSync(hookInput.transcriptPath, "utf-8")
+      .split(/\r?\n/)
+      .filter((l) => l.trim() !== "").length;
+    if (lines < MIN_TRANSCRIPT_LINES) process.exit(0);
+  } catch {
+    /* 못 읽음 — 게이트를 통과시킨다 */
+  }
+}
+
+writeMarker({ ...m, warned: true });
 process.stdout.write(
-  `BigBrainMemory: 이 세션에서 새로 저장된 기억이 0건입니다 (${before}건 그대로).\n` +
+  `BigBrainMemory: 이 세션에서 새로 저장된 기억이 없습니다 (볼트 ${m.count}건 그대로).\n` +
     `지속될 사실·결정·선호·교훈을 배웠다면 지금 \`remember\` 로 남기세요. ` +
-    `이번 대화에서만 쓸 내용이었다면 무시해도 됩니다.\n`,
+    `이번 대화에서만 쓸 내용이었다면 무시해도 됩니다. (이 알림은 세션당 한 번만 나옵니다)\n`,
 );
 process.exit(0); // 경고일 뿐 — 세션 종료를 막지 않는다
