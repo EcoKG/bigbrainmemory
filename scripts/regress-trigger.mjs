@@ -61,6 +61,48 @@ async function boot(vaultDir, extraEnv = {}) {
   return { instructions, stderr, tools };
 }
 
+// ── 0. 훅 미설치 감지 (E5)
+//
+// 고정하는 문제: 대조 실험 40회가 SessionStart 훅을 **주 메커니즘**으로 특정했다.
+//   1차(지연 로드) ON 10/10 · OFF 6/10 (p=0.043)
+//   2차(상시 로드) ON 10/10 · OFF 7/10 (p=0.105)
+//   층화검정(CMH, 40회) p=0.0074
+// 그런데 훅 설치는 옵트인이라, 안 깐 사용자는 조용히 35% 를 흘리면서 그 사실조차
+// 모른다. 서버가 훅을 대신할 수는 없으므로(instructions 는 온전히 전달되는데도
+// 행동을 못 만든다) 최선은 **없다는 사실을 크게 말하는 것**이다.
+console.log("0) SessionStart 훅 미설치 감지 (E5)");
+{
+  const dir = freshDir();
+  // HOME/USERPROFILE 을 빈 디렉터리로 돌려 "훅 미설치" 상태를 만든다
+  const emptyHome = freshDir();
+  const off = await boot(dir, { HOME: emptyHome, USERPROFILE: emptyHome });
+  check("미설치면 instructions 에 경고", /SessionStart hook is NOT installed/.test(off.instructions), off.instructions.slice(0, 200));
+  check("근거(20/20 vs 13/20)를 함께 제시", /20\/20/.test(off.instructions) && /13\/20/.test(off.instructions));
+  check("조치 방법을 지시", /npm run setup:hook/.test(off.instructions));
+  check("스스로 보완하라는 지시", /`recall` now and `remember` as soon as a trigger fires/.test(off.instructions), off.instructions.slice(-300));
+  check("사람도 보게 stderr 에도 출력", /setup:hook/.test(off.stderr), off.stderr.slice(0, 300));
+  // 경고가 붙은 상태가 예산상 최악이다 — 이때도 넘치면 안 된다
+  check(`경고 포함 ${off.instructions.length}자 ≤ 2048`, off.instructions.length <= 2048);
+  check("경고가 행동수칙을 밀어내지 않음", /RECALL FIRST/.test(off.instructions) && /2\. REMEMBER/.test(off.instructions));
+
+  // 훅이 설치돼 있으면 한 줄도 나가지 않는다 — 평상시 예산을 축내면 안 된다
+  const fakeHome = freshDir();
+  fs.mkdirSync(path.join(fakeHome, ".claude"), { recursive: true });
+  fs.writeFileSync(
+    path.join(fakeHome, ".claude", "settings.json"),
+    JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command", command: "node /x/session-guard.mjs --start" }] }] } }),
+    "utf-8",
+  );
+  const on = await boot(dir, { HOME: fakeHome, USERPROFILE: fakeHome });
+  check("설치돼 있으면 경고 없음", !/SessionStart hook is NOT installed/.test(on.instructions), on.instructions.slice(0, 200));
+  check("설치돼 있으면 stderr 도 조용", !/setup:hook/.test(on.stderr), on.stderr.slice(0, 200));
+  check("경고가 빠진 만큼 예산이 돌아옴", on.instructions.length < off.instructions.length);
+
+  // 끄고 싶은 사용자를 위한 탈출구
+  const opted = await boot(dir, { HOME: emptyHome, USERPROFILE: emptyHome, BIGBRAIN_HOOK_CHECK: "0" });
+  check("BIGBRAIN_HOOK_CHECK=0 이면 검사 자체를 끔", !/SessionStart hook is NOT installed/.test(opted.instructions));
+}
+
 // ── 1. 인덱스가 instructions 에 실린다 (E1)
 console.log("1) 기억 인덱스 자동 노출 (E1)");
 {

@@ -1,4 +1,6 @@
 ﻿#!/usr/bin/env node
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -35,6 +37,48 @@ function computeVaultWarning(): string | null {
  * 나중에 다시 계산하면 경고가 사라져 instructions 와 stderr 가 어긋난다.
  */
 const VAULT_WARNING = computeVaultWarning();
+
+/**
+ * SessionStart 훅이 설치돼 있는지 본다.
+ *
+ * 왜 서버가 훅 설치 여부까지 신경 쓰는가 — 40회 대조 실험이 훅을 **주 메커니즘**으로
+ * 특정했기 때문이다:
+ *   1차(지연 로드)    ON 10/10  OFF  6/10   p=0.043
+ *   2차(상시 로드)    ON 10/10  OFF  7/10   p=0.105
+ *   층화(CMH, 40회)                          p=0.0074
+ * 두 라운드에서 방향이 일치했고, 훅이 없으면 저장률이 65% 로 떨어진다.
+ *
+ * 결정적으로 **서버는 이 역할을 대신할 수 없다.** instructions 는 온전히 전달되는데도
+ * (1485자, 무절단) 행동을 만들지 못했다. 훅 출력은 대화 컨텍스트에 블록으로 들어가는
+ * 반면 instructions 는 서버 메타데이터로 들어가고, 그 차이가 실제 행동 차이를 만든다.
+ * MCP 에는 대화 컨텍스트에 자동 주입되는 채널이 없다(prompts·resources 는 호출해야 한다).
+ *
+ * 그래서 서버가 할 수 있는 최선은 **없다는 사실을 크게 말하는 것**이다. 훅 설치는
+ * 옵트인이라, 안 깐 사용자는 조용히 35% 를 흘리면서 그 사실조차 모른다.
+ * 자동 설치는 하지 않는다 — 전역 설정을 몰래 고치는 건 나쁜 관행이고, CI 나
+ * Claude Code 를 쓰지 않는 환경에서도 실행돼 버린다.
+ */
+function computeHookWarning(): string | null {
+  if (process.env.BIGBRAIN_HOOK_CHECK === "0") return null;
+  const candidates = [
+    path.join(os.homedir(), ".claude", "settings.json"),
+    path.join(process.cwd(), ".claude", "settings.json"),
+    path.join(process.cwd(), ".claude", "settings.local.json"),
+  ];
+  for (const fp of candidates) {
+    try {
+      if (/session-guard/.test(fs.readFileSync(fp, "utf-8"))) return null;
+    } catch {
+      /* 없거나 못 읽음 — 다음 후보 */
+    }
+  }
+  return (
+    "NOTE: the BigBrainMemory SessionStart hook is NOT installed. In 40 controlled trials sessions saved " +
+    "20/20 with it vs 13/20 without — these instructions alone often fail. Ask the user to run " +
+    "`npm run setup:hook`; until then, `recall` now and `remember` as soon as a trigger fires."
+  );
+}
+const HOOK_WARNING = computeHookWarning();
 
 const MEMORY_TYPE = z
   .enum(["episodic", "semantic", "procedural", "preference"])
@@ -150,8 +194,12 @@ function vaultState(): { state: string[]; items: string[]; total: number } {
  */
 function buildInstructions(): string {
   const { state, items, total } = vaultState();
-  const head = [
+  // 절대 양보하지 않는 부분 — 경고와 행동수칙. 이게 이 서버만이 줄 수 있는 값이다.
+  const essential = [
     ...(VAULT_WARNING ? [VAULT_WARNING, ""] : []),
+    // 훅 부재 경고는 행동수칙보다 앞에 둔다 — 수칙이 왜 잘 안 먹히는지를 설명하는 전제다.
+    // 훅이 깔려 있으면 이 줄은 아예 없으므로 평상시 예산을 축내지 않는다.
+    ...(HOOK_WARNING ? [HOOK_WARNING, ""] : []),
     "BigBrainMemory is a persistent memory vault (Obsidian-compatible markdown). Behave like someone with long-term memory:",
     "1. RECALL FIRST — at the start of a task, or when the user mentions past context, call `recall` before answering.",
     "2. REMEMBER — call `remember` the moment any of these happens, not at the end of the session: you edited a durable doc (CLAUDE.md, README, design notes) and a decision settled; the user corrected you or stated a preference; you finished exploring unfamiliar code and formed a conclusion worth reusing; you found a non-obvious root cause; a convention or workflow was agreed. Skip trivia that only matters in this conversation.",
@@ -159,8 +207,13 @@ function buildInstructions(): string {
     "4. ASSOCIATE — `link` related memories so recall spreads across them.",
     "5. REFLECT — periodically call `reflect`, then clean up. Nothing is ever auto-deleted.",
     "This vault is a different store from CLAUDE.md and any built-in file memory, and is reached only through `recall` — storing a durable fact here is not duplication even if a project file also mentions it.",
-    ...state,
   ];
+
+  // 볼트 상태 설명(COLD START·스코프 안내)은 경고·수칙보다 낮은 우선순위다.
+  // **머리 부분만으로 예산이 찰 수 있다** — 경고가 붙는 최악의 경우가 그렇다.
+  // 그때 인덱스만 잘라봐야 소용없으므로, 상태 설명을 먼저 버린다. 이 방어가 없으면
+  // 예산 초과분이 클라이언트에서 잘려나가고, 하필 맨 뒤의 지시부터 사라진다.
+  const head = [...essential, ...state].join("\n").length <= INSTRUCTIONS_BUDGET ? [...essential, ...state] : essential;
 
   // 헤더는 자르기 **전** 총건수(total)를 말한다 — INDEX_LIMIT/예산으로 줄어든 수를
   // 총계로 쓰면 모델이 "이게 전부" 라고 오해해 없는 기억을 찾지 않는다.
@@ -271,14 +324,17 @@ function fail(message: string) {
 /**
  * `remember` / `recall` 을 **지연 로드에서 제외**시키는 표식.
  *
- * 왜 필요한가 — 20회 대조 실험이 병목을 특정했다:
- *   ToolSearch 로 도구를 로드한 회차 16/16 이 전부 저장했다. 저장할지 고민하다
- *   안 한 경우는 **한 건도 없었다.** 실패는 전부 `remember` 가 존재한다는 사실에
- *   도달하지 못한 것이었다(훅 ON 10/10 vs OFF 6/10, Fisher 단측 p=0.043).
+ * ⚠️ 이 표식을 넣은 원래 근거는 **틀렸다.** 당시 근거는 "ToolSearch 로 도구를 로드한
+ * 회차 16/16 이 전부 저장했으므로 병목은 발견이다" 였는데, 이건 인과가 아니라
+ * 선택 효과였다 — ToolSearch 를 부른 회차는 이미 메모리를 쓰기로 한 회차라 저장률이
+ * 100% 인 게 당연하다. 상시 로드를 적용한 2차 20회에서 훅 OFF 는 6/10 → 7/10 로
+ * 사실상 그대로였고, 실패 3건은 전부 **도구가 이미 보이는 상태에서 안 부른** 것이었다.
+ * 실패의 성격이 바뀌었을 뿐 사라지지 않았다.
  *
- * 즉 문제는 설득이 아니라 **발견**이다. 지침 문구를 아무리 다듬어도, 도구 이름이
- * 컨텍스트에 없으면 모델은 ToolSearch 를 부를 이유 자체를 갖지 못한다. 훅 주입이
- * 효과를 낸 이유도 설득이 아니라 도구 이름을 띄웠기 때문이다.
+ * 그래도 유지하는 이유: 2차 표본(팔당 10회)은 60%→70% 크기의 차이를 잡을 검정력이
+ * 없다(그러려면 팔당 약 280회 필요). 즉 **효과가 없다고 반증된 게 아니라 미측정**이다.
+ * 비용은 도구 2개 분량의 컨텍스트뿐이고 해가 없으므로 남긴다. 다만 이것을 "저장
+ * 문제의 해법" 으로 취급해서는 안 된다 — 확인된 주 메커니즘은 SessionStart 훅이다.
  *
  * 이 두 개만 표시한다. 나머지 6개(revise/forget/link/reflect/read_memory/
  * list_memories)는 모델이 이미 메모리를 쓰기 시작한 뒤에 필요해지므로 지연 로드로
@@ -606,6 +662,13 @@ async function main() {
   if (DEFAULT_PROJECT) parts.push(`project=${DEFAULT_PROJECT}`);
   console.error(`[BigBrainMemory] ready. vault=${vaultDir} ${parts.join(" ")}`);
   if (VAULT_WARNING) console.error(`[BigBrainMemory] ${VAULT_WARNING}`);
+  if (HOOK_WARNING) {
+    console.error(
+      `[BigBrainMemory] SessionStart 훅이 설치돼 있지 않습니다. 대조 실험 40회에서 훅이 있으면 20/20, ` +
+        `없으면 13/20 이 저장됐습니다 — instructions 만으로는 저장이 잘 일어나지 않습니다. ` +
+        `BigBrainMemory 저장소에서 \`npm run setup:hook\` 을 실행해 주세요.`,
+    );
+  }
   if (st.quarantined > 0) {
     console.error(
       `[BigBrainMemory] 격리된 손상 파일 ${st.quarantined}건이 있습니다 — vault/quarantine/ 확인 필요`,
