@@ -106,14 +106,18 @@ function resolveVault() {
  * 호스트가 훅을 띄울 때 PATH 가 비어 있을 수 있기 때문이다.
  * 경로는 forward slash 로 통일해 JSON 백슬래시 이스케이프를 피한다.
  */
-function buildCommands(vaultDir) {
+function buildCommands(vaultDir, explicit) {
   const node = process.execPath.replace(/\\/g, "/");
   const guard = GUARD.replace(/\\/g, "/");
   const vault = vaultDir.replace(/\\/g, "/");
+  // 사용자가 --vault 로 명시했으면 --vault-force 로 박아 자동탐지를 이기게 하고,
+  // 자동 감지값이면 --vault 로 넘겨 **실행 시점 탐지가 우선**하게 둔다.
+  // 후자가 핵심이다: 설치 시점 경로를 고정하면 프로젝트별 볼트 분리가 깨진다.
+  const flag = explicit ? "--vault-force" : "--vault";
   const base = `"${node}" "${guard}"`;
   return {
-    SessionStart: `${base} --start --vault "${vault}"`,
-    Stop: `${base} --stop --vault "${vault}"`,
+    SessionStart: `${base} --start ${flag} "${vault}"`,
+    Stop: `${base} --stop ${flag} "${vault}"`,
   };
 }
 
@@ -181,11 +185,17 @@ function backup() {
 console.log(`BigBrainMemory — 세션 훅 ${REMOVE ? "제거" : "설치"}\n`);
 
 const vault = resolveVault();
-const commands = buildCommands(vault.dir);
+const explicitVault = vault.source === "--vault 플래그";
+const commands = buildCommands(vault.dir, explicitVault);
 
 console.log(`설정 파일 : ${settingsPath}`);
 console.log(`볼트 경로 : ${vault.dir}`);
 console.log(`  └ 출처  : ${vault.source}`);
+console.log(
+  explicitVault
+    ? `  └ 고정  : --vault 로 명시하셨으므로 이 경로로 고정합니다.`
+    : `  └ 추적  : 훅은 매 세션 실행 시점에 볼트를 다시 해석합니다 — 프로젝트별\n            .mcp.json 으로 볼트를 나눠도 훅이 따라갑니다(이 값은 폴백).`,
+);
 if (!fs.existsSync(vault.dir)) {
   console.log(`  ⚠ 아직 존재하지 않습니다 — 첫 기억을 저장하면 생성됩니다.`);
 }

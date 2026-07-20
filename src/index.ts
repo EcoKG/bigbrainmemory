@@ -73,10 +73,22 @@ function memoryIndexLines(): string[] {
   try {
     items = store.list(DEFAULT_PROJECT ? { project: DEFAULT_PROJECT } : undefined);
   } catch (err) {
-    console.error(
-      `[BigBrainMemory] 인덱스 요약 생략(계속 진행): ${err instanceof Error ? err.message : String(err)}`,
-    );
-    return [];
+    const detail = err instanceof Error ? err.message : String(err);
+    console.error(`[BigBrainMemory] 인덱스 요약 실패(계속 진행): ${detail}`);
+    /**
+     * 빈 배열을 돌려주면 안 된다.
+     *
+     * memoryIndexLines() 는 "인덱스 / EMPTY / COLD START" 중 하나를 반드시 내보낸다는
+     * 전제로 쓰이는데, 이 catch 만 아무것도 내보내지 않았다. 그 결과 모델은 기억 상태에
+     * 대한 신호를 **하나도** 받지 못하고, 실패 사실은 stderr 한 줄로만 남아 사람도
+     * 모델도 알 수 없었다(실제로 세 표식이 전부 0건인 세션이 관측됐다).
+     * 인덱스를 못 만들어도 행동 지시와 실패 사실은 반드시 전달한다.
+     */
+    return [
+      "",
+      `NOTE — the vault index could not be built this session (${detail}). The memory tools still work; this only means you cannot see an up-front list of what is stored.`,
+      "Do NOT infer from this that the vault is empty or unused: call `recall` before concluding anything is missing, and keep storing per the REMEMBER triggers above.",
+    ];
   }
   const scope = DEFAULT_PROJECT
     ? [

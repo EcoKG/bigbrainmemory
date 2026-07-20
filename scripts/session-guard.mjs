@@ -15,6 +15,7 @@
 //       종료 코드는 항상 0 이다(Stop 훅이 0 이 아니면 세션 종료를 막을 수 있다).
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 /** 세션 시작 시점의 기억 수를 담는 마커 (볼트 루트, 점 파일이라 Obsidian 에서 숨겨진다) */
@@ -24,13 +25,79 @@ const MAX_LINES = 200;
 
 const argv = process.argv.slice(2);
 const mode = argv.includes("--stop") ? "stop" : "start";
-const vaultFlagIdx = argv.indexOf("--vault");
-const vaultArg = vaultFlagIdx >= 0 ? argv[vaultFlagIdx + 1] : undefined;
+const argValue = (flag) => {
+  const i = argv.indexOf(flag);
+  return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
+};
+/** 자동탐지가 실패했을 때만 쓰는 폴백 (설치 시점 자동 감지값) */
+const vaultArg = argValue("--vault");
+/** 사용자가 설치 시 명시한 경로 — 자동탐지보다 우선한다 */
+const vaultForced = argValue("--vault-force");
 
-// 경로가 없으면 침묵 종료 — 설정이 어긋났다고 세션을 시끄럽게 만들지 않는다
-if (!vaultArg) process.exit(0);
+/** JSON 파일을 조용히 읽는다 (없거나 깨졌으면 null) */
+function readJson(fp) {
+  try {
+    return JSON.parse(fs.readFileSync(fp, "utf-8").replace(/^﻿/, ""));
+  } catch {
+    return null;
+  }
+}
 
-const vaultDir = path.resolve(vaultArg);
+/** mcpServers 맵에서 bigbrain 계열 서버의 BIGBRAIN_VAULT 를 찾는다 */
+function vaultFromServers(servers) {
+  if (!servers || typeof servers !== "object") return null;
+  for (const [name, cfg] of Object.entries(servers)) {
+    if (!/bigbrain/i.test(name)) continue;
+    const v = cfg?.env?.BIGBRAIN_VAULT;
+    if (typeof v === "string" && v.trim() !== "") return v;
+  }
+  return null;
+}
+
+/**
+ * **실행 시점**에 볼트를 해석한다 — 이것이 이 스크립트의 핵심이다.
+ *
+ * 설치 시점 경로를 훅에 박아두면, 프로젝트마다 BIGBRAIN_VAULT 로 볼트를 나누는
+ * 순간 훅만 옛 볼트를 계속 바라본다. 그러면 한 세션 안에서
+ *   훅  : "볼트에 이런 기억들이 있다" (볼트 B 내용)
+ *   서버: "COLD START — this vault is EMPTY" (볼트 A 기준)
+ * 라는 **정면으로 모순된 두 신호**가 동시에 주입된다. 모델은 인덱스에 내용이
+ * 보이면 "메모리는 이미 잘 돌고 있다" 고 판단해 저장을 건너뛰기 쉽다.
+ * 실제로 그 분열이 관측됐다(훅은 실제 볼트 3건, 서버는 빈 테스트 볼트).
+ *
+ * 그래서 서버와 **같은 근거**를 같은 우선순위로 다시 읽는다.
+ * 훅은 프로젝트 디렉터리에서 실행되므로 cwd 가 기준점이다.
+ */
+function resolveVault(fallback, forced) {
+  const cwd = process.cwd();
+
+  // 사용자가 설치 시 --vault 로 **명시**했다면 그 의도가 자동탐지를 이긴다
+  if (forced) return { dir: path.resolve(forced), source: "설치 시 명시(--vault)" };
+
+  if (process.env.BIGBRAIN_VAULT?.trim()) {
+    return { dir: path.resolve(process.env.BIGBRAIN_VAULT), source: "BIGBRAIN_VAULT 환경변수" };
+  }
+  // 프로젝트 스코프가 사용자 전역보다 우선한다
+  const fromProject = vaultFromServers(readJson(path.join(cwd, ".mcp.json"))?.mcpServers);
+  if (fromProject) return { dir: path.resolve(cwd, fromProject), source: "프로젝트 .mcp.json" };
+
+  const userCfg = readJson(path.join(os.homedir(), ".claude.json"));
+  const fromUserProject = vaultFromServers(userCfg?.projects?.[cwd]?.mcpServers);
+  if (fromUserProject) {
+    return { dir: path.resolve(fromUserProject), source: "~/.claude.json (이 프로젝트)" };
+  }
+  const fromUserGlobal = vaultFromServers(userCfg?.mcpServers);
+  if (fromUserGlobal) return { dir: path.resolve(fromUserGlobal), source: "~/.claude.json (전역)" };
+
+  if (fallback) return { dir: path.resolve(fallback), source: "설치 시점 기본값" };
+  return null;
+}
+
+const resolved = resolveVault(vaultArg, vaultForced);
+// 어디서도 볼트를 못 찾으면 침묵 종료 — 설정이 어긋났다고 세션을 시끄럽게 만들지 않는다
+if (!resolved) process.exit(0);
+
+const vaultDir = resolved.dir;
 const memoriesDir = path.join(vaultDir, "memories");
 const markerPath = path.join(vaultDir, MARKER);
 
@@ -57,7 +124,16 @@ if (mode === "start") {
     const md = fs.readFileSync(path.join(vaultDir, "MEMORY.md"), "utf-8").replace(/^﻿/, "");
     const body = md.split(/\r?\n/).slice(0, MAX_LINES).join("\n").trimEnd();
     if (body !== "") {
-      process.stdout.write(`<bigbrainmemory-index>\n${body}\n</bigbrainmemory-index>\n`);
+      // 출처(볼트 경로·건수)를 함께 밝힌다 — 서버가 다른 볼트를 보고 있으면
+      // "인덱스엔 기억이 있는데 서버는 EMPTY" 라는 모순이 눈에 보여야 한다.
+      // 밝히지 않으면 모델은 인덱스만 보고 "메모리가 잘 돌고 있다" 고 오판한다.
+      const attrs = `vault="${vaultDir.replace(/\\/g, "/")}" memories="${countMemories()}"`;
+      process.stdout.write(
+        `<bigbrainmemory-index ${attrs}>\n${body}\n</bigbrainmemory-index>\n` +
+          `(This index was injected by a SessionStart hook reading the vault above. ` +
+          `If the bigbrainmemory server reports a different vault or says the vault is EMPTY, ` +
+          `the two are pointing at different paths — trust the server's tools, and tell the user about the mismatch.)\n`,
+      );
     }
   } catch {
     /* MEMORY.md 없음 — 콜드 스타트. 서버 instructions 가 그 상황을 따로 안내한다 */
