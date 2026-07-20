@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+﻿#!/usr/bin/env node
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -49,6 +49,26 @@ const INDEX_LIMIT = (() => {
 })();
 
 /**
+ * instructions 문자 예산 — **클라이언트가 초과분을 말없이 잘라낸다**.
+ *
+ * 실측: 전달된 블록 2079자 = 헤더 "## BigBrainMemory\n"(18) + 본문 2048 + "… [truncated]"(13).
+ * 정확히 2^11 이다. 서버는 3268자(빈 볼트)를 내보내고 있었으므로 37% 가 유실됐다.
+ *
+ * 치명적이었던 것은 **잘리는 순서**다. memoryIndexLines() 출력이 배열 맨 끝에 붙어
+ * 있어서 가장 먼저 잘렸고, 그 결과
+ *   - E1(기억 인덱스 자동 노출)은 설계 이래 **한 번도 모델에 도달한 적이 없으며**
+ *   - COLD START 지시도, age_days 해석 지침도 전량 유실됐다.
+ * 회귀 테스트 15종이 이를 전부 놓친 이유는 "서버가 내보낸 문자열" 만 검사했기 때문이다.
+ *
+ * 그래서 이제 예산을 명시적으로 잡고, 우선순위가 낮은 것부터 **서버가 스스로 줄인다**.
+ * 잘림을 클라이언트에 맡기지 않는다.
+ */
+const INSTRUCTIONS_BUDGET = (() => {
+  const v = Number(process.env.BIGBRAIN_INSTRUCTIONS_BUDGET);
+  return Number.isFinite(v) && v > 0 ? v : 2048;
+})();
+
+/**
  * 이 서버 인스턴스의 기본 프로젝트 스코프 (감사 E2).
  * 프로젝트별 .mcp.json 의 env 로 지정하면 그 프로젝트의 기억만 + 전역 기억이 회상된다.
  * 미지정이면 스코프 필터를 걸지 않는다(= 종전과 동일하게 전체 조회).
@@ -68,91 +88,113 @@ const DEFAULT_PROJECT = process.env.BIGBRAIN_PROJECT?.trim() || undefined;
  * 주의: 이 스냅샷은 **서버 기동 시점** 기준이다. 항상 최신이 필요하면
  * SessionStart 훅으로 vault/MEMORY.md 를 주입하는 방법을 README 참조.
  */
-function memoryIndexLines(): string[] {
-  let items: ReturnType<typeof store.list>;
+/**
+ * 볼트 상태 안내(짧고 가치 높음)와 인덱스 항목(길고 가변)을 분리해 돌려준다.
+ * `total` 은 INDEX_LIMIT/예산으로 자르기 **전** 의 실제 건수다 — 헤더가 총계를
+ * 잘못 말하면 모델이 "이게 전부" 라고 오해한다.
+ */
+function vaultState(): { state: string[]; items: string[]; total: number } {
+  let list: ReturnType<typeof store.list>;
   try {
-    items = store.list(DEFAULT_PROJECT ? { project: DEFAULT_PROJECT } : undefined);
+    list = store.list(DEFAULT_PROJECT ? { project: DEFAULT_PROJECT } : undefined);
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     console.error(`[BigBrainMemory] 인덱스 요약 실패(계속 진행): ${detail}`);
-    /**
-     * 빈 배열을 돌려주면 안 된다.
-     *
-     * memoryIndexLines() 는 "인덱스 / EMPTY / COLD START" 중 하나를 반드시 내보낸다는
-     * 전제로 쓰이는데, 이 catch 만 아무것도 내보내지 않았다. 그 결과 모델은 기억 상태에
-     * 대한 신호를 **하나도** 받지 못하고, 실패 사실은 stderr 한 줄로만 남아 사람도
-     * 모델도 알 수 없었다(실제로 세 표식이 전부 0건인 세션이 관측됐다).
-     * 인덱스를 못 만들어도 행동 지시와 실패 사실은 반드시 전달한다.
-     */
-    return [
-      "",
-      `NOTE — the vault index could not be built this session (${detail}). The memory tools still work; this only means you cannot see an up-front list of what is stored.`,
-      "Do NOT infer from this that the vault is empty or unused: call `recall` before concluding anything is missing, and keep storing per the REMEMBER triggers above.",
-    ];
+    // 빈 배열을 돌려주면 모델은 기억 상태 신호를 하나도 못 받는다 — 실패 사실이라도 전한다
+    return {
+      state: [
+        `NOTE — the vault index could not be built (${detail}). The tools still work; you just cannot see an up-front list.`,
+        "Do NOT infer the vault is empty: call `recall` before concluding anything is missing.",
+      ],
+      items: [],
+      total: 0,
+    };
   }
+
   const scope = DEFAULT_PROJECT
     ? [
-        "",
-        `Current project scope: "${DEFAULT_PROJECT}". Recall returns this project's memories plus global ones.`,
-        `When storing, set \`project: "${DEFAULT_PROJECT}"\` for facts that only apply here; omit \`project\` for knowledge that should follow the user everywhere (preferences, general workflows).`,
+        `Project scope "${DEFAULT_PROJECT}": recall returns this project's memories plus global ones. When storing, set \`project\` for facts only true here; omit it for knowledge that should follow the user everywhere.`,
       ]
     : [];
-  /**
-   * 콜드 스타트(0건)일수록 지시를 **강하게** 준다.
-   *
-   * 종전에는 빈 볼트일 때 한 문장만 내보내고, 조기 반환 탓에 위 스코프 안내마저
-   * 건너뛰었다 — 설득이 가장 필요한 시점에 가장 약하게 말하는 역전이었다.
-   * 실제로 빈 볼트 세션이 0건 저장으로 끝나는 사례가 보고됐다.
-   * 인덱스로 노출할 것이 없을수록 그 자리를 행동 지시로 채운다.
-   */
-  if (items.length === 0) {
-    return [
-      ...scope,
-      "",
-      "COLD START — this vault is EMPTY (0 memories stored).",
-      "`recall` will therefore return nothing. That is expected on a fresh vault and is NOT evidence that memory is unneeded or that the server is broken — do not silently skip storing because the first recall came back empty.",
-      "Seeding the vault is part of this session's job: the moment any REMEMBER trigger above fires, call `remember` at that point rather than deferring to the end of the session — there may be no end-of-session turn in which to catch up.",
-    ];
+
+  if (list.length === 0) {
+    return {
+      state: [
+        ...scope,
+        "COLD START — this vault is EMPTY (0 memories). `recall` will return nothing; that is expected on a fresh vault and is NOT evidence memory is unneeded. Seeding it is part of this session's job: when a REMEMBER trigger fires, call `remember` right then, not at the end.",
+      ],
+      items: [],
+      total: 0,
+    };
   }
-  if (INDEX_LIMIT === 0) return scope; // 인덱스 생략 (스코프 안내는 유지)
-  const shown = items.slice(0, INDEX_LIMIT);
-  const head =
-    items.length > shown.length
-      ? `Vault index — ${items.length} memories stored, ${shown.length} most recently updated shown. Use \`recall\` for the full text and anything not listed:`
-      : `Vault index — ${items.length} memories currently stored. Use \`recall\` to read the full text:`;
-  return [
-    ...scope,
-    "",
-    head,
-    ...shown.map((m) => `- [${m.type}] ${m.title} — ${m.description}`),
-  ];
+  if (INDEX_LIMIT === 0) return { state: scope, items: [], total: list.length };
+  return {
+    state: scope,
+    items: list.slice(0, INDEX_LIMIT).map((m) => `- [${m.type}] ${m.title} — ${m.description}`),
+    total: list.length,
+  };
 }
+
+/**
+ * 예산(INSTRUCTIONS_BUDGET) 안에서 instructions 를 조립한다.
+ *
+ * 우선순위가 핵심이다. 종전에는 가장 동적이고 행동을 지시하는 내용이 배열 맨 끝에
+ * 있어서 **100% 잘려나갔다**. 이제 순서를 뒤집고, 넘치면 서버가 스스로 줄인다:
+ *   1) 볼트 경고        — 잘못된 볼트를 쓰는 사고를 막는 최우선 신호
+ *   2) 행동수칙 1~5     — 이 서버의 유일하고 대체 불가능한 가치
+ *   3) 볼트 상태        — COLD START / 스코프 안내 (짧고 행동을 바꾼다)
+ *   4) 기억 인덱스      — 남는 예산만큼만. SessionStart 훅(길이 제한 없음)이 같은
+ *                          역할을 하므로, 예산이 부족하면 가장 먼저 양보한다.
+ * 정적 설명(confidence 축 구분, source 권고, age_days 해석)은 도구 description 으로
+ * 옮겼다 — 도구 스키마는 이 예산과 별개로 전달되고, 어차피 그 도구를 쓸 때 필요하다.
+ */
+function buildInstructions(): string {
+  const { state, items, total } = vaultState();
+  const head = [
+    ...(VAULT_WARNING ? [VAULT_WARNING, ""] : []),
+    "BigBrainMemory is a persistent memory vault (Obsidian-compatible markdown). Behave like someone with long-term memory:",
+    "1. RECALL FIRST — at the start of a task, or when the user mentions past context, call `recall` before answering.",
+    "2. REMEMBER — call `remember` the moment any of these happens, not at the end of the session: you edited a durable doc (CLAUDE.md, README, design notes) and a decision settled; the user corrected you or stated a preference; you finished exploring unfamiliar code and formed a conclusion worth reusing; you found a non-obvious root cause; a convention or workflow was agreed. Skip trivia that only matters in this conversation.",
+    "3. CORRECT — when new information contradicts a memory, `revise` it (or `forget` if it is simply wrong) instead of storing a duplicate. If `remember` reports similar memories, revise one of those.",
+    "4. ASSOCIATE — `link` related memories so recall spreads across them.",
+    "5. REFLECT — periodically call `reflect`, then clean up. Nothing is ever auto-deleted.",
+    "This vault is a different store from CLAUDE.md and any built-in file memory, and is reached only through `recall` — storing a durable fact here is not duplication even if a project file also mentions it.",
+    ...state,
+  ];
+
+  // 헤더는 자르기 **전** 총건수(total)를 말한다 — INDEX_LIMIT/예산으로 줄어든 수를
+  // 총계로 쓰면 모델이 "이게 전부" 라고 오해해 없는 기억을 찾지 않는다.
+  const indexHeader = (shownCount: number) =>
+    shownCount < total
+      ? `Vault index (${total} stored, ${shownCount} most recently updated shown) — use \`recall\` for the rest:`
+      : `Vault index (${total} stored) — use \`recall\` for full text:`;
+
+  let text = head.join("\n");
+  if (items.length > 0) {
+    // 남는 예산만큼만 인덱스를 싣는다 — 한 줄도 못 실으면 헤더째 생략한다
+    const shown: string[] = [];
+    for (const line of items) {
+      const candidate = [...head, indexHeader(shown.length + 1), ...shown, line].join("\n");
+      if (candidate.length > INSTRUCTIONS_BUDGET) break;
+      shown.push(line);
+    }
+    if (shown.length > 0) text = [...head, indexHeader(shown.length), ...shown].join("\n");
+  }
+
+  if (text.length > INSTRUCTIONS_BUDGET) {
+    // 고정부만으로 예산을 넘는 경우 — 잘림을 클라이언트에 맡기지 않고 알린다
+    console.error(
+      `[BigBrainMemory] instructions ${text.length}자 — 예산 ${INSTRUCTIONS_BUDGET} 초과. 클라이언트가 뒷부분을 자를 수 있습니다.`,
+    );
+  }
+  return text;
+}
+
+const INSTRUCTIONS = buildInstructions();
 
 const server = new McpServer(
   { name: "bigbrainmemory", version: "0.1.0" },
-  {
-    instructions: [
-      // 경고가 있으면 맨 앞 — 모델이 빈 결과를 "기억 없음" 으로 오해하지 않도록
-      ...(VAULT_WARNING ? [VAULT_WARNING, ""] : []),
-      "BigBrainMemory is a persistent, human-like memory vault (Obsidian-compatible markdown).",
-      "Behave like a person with long-term memory:",
-      "1. RECALL FIRST — at the start of a task, or when the user mentions past context, call `recall` before answering.",
-      // \"after learning\" 은 경계가 없어 모델이 시점을 판정할 수 없었다(무저장 세션의 주원인).
-      // RECALL 의 \"at the start of a task\" 처럼 **관측 가능한 사건**으로 앵커를 바꾼다.
-      "2. REMEMBER — call `remember` as soon as any of these OBSERVABLE events happens, at that moment rather than at the end of the session: (a) you wrote or edited a durable doc (CLAUDE.md, README, design/spec notes) and a decision got settled in it; (b) the user corrected you, or stated a preference or constraint; (c) you finished exploring an unfamiliar codebase and formed a conclusion you would want next time; (d) you found a non-obvious root cause; (e) a convention, workflow, or naming rule was agreed. Skip trivia that only matters inside this conversation.",
-      "3. CORRECT — when new information contradicts an existing memory, call `revise` (fixable) or `forget` (wrong memory) instead of piling up duplicates. If `remember` reports similar memories, prefer revising them.",
-      "4. ASSOCIATE — connect related memories with `link` so recall can spread across them.",
-      "5. REFLECT — periodically call `reflect` to find weakened, low-confidence, or duplicate memories and clean them up (forget candidates are surfaced, never auto-deleted).",
-      // 내장 파일 메모리(CLAUDE.md 등)와 이 볼트는 **서로 다른 저장소**다.
-      // 이 구분을 명시하지 않으면 "CLAUDE.md 가 이미 기록하는 것은 저장하지 말라" 류의
-      // 일반 규칙이 볼트 저장까지 함께 억제한다(무저장 세션의 두 번째 원인).
-      "SEPARATE STORE — this vault is a different store from CLAUDE.md, project docs, or any built-in file memory, and is reached only through `recall`. A fact written into CLAUDE.md is not retrievable by `recall` from another project or session, so recording a durable fact here is not duplication even when a project file also mentions it. Judge what to store by the REMEMBER triggers above, not by whether some other file happens to cover it.",
-      "Two independent dimensions (do not conflate them): `confidence` = how likely the memory is TRUE (change only via `revise`); recall accessibility = base-level activation from frequency+recency, computed automatically. A rarely-recalled memory can still be highly trusted, and vice versa.",
-      "Record a `source` when you know where a fact came from — it prevents source confusion later. Memories are stored verbatim and never auto-merged; consolidate only via explicit `revise`.",
-      "Every result carries `age_days` (days since last update). A memory is a point-in-time observation, not live state: when it cites code, file paths, versions or config and `stale_hint` is present, verify against the current source before asserting it as fact — and `revise` it when reality has moved on.",
-      ...memoryIndexLines(),
-    ].join("\n"),
-  },
+  { instructions: INSTRUCTIONS },
 );
 
 /** 이 일수 이상 갱신되지 않은 기억에 낡음 경고를 붙인다 (0 이면 항상 경고) */
@@ -233,7 +275,12 @@ server.registerTool(
     description:
       "Store a durable memory as a markdown note in the vault. Call this after learning a lasting fact, user preference, decision, lesson, or workflow. " +
       "NOT for transient conversation details. If the result lists `similar_existing_memories`, consider calling `revise` on one of them instead of keeping a duplicate. " +
-      "Use `supersedes` to replace an outdated memory with this new one.",
+      "Use `supersedes` to replace an outdated memory with this new one.\n" +
+      // instructions 예산(2048자) 밖으로 밀려나 모델에 전달되지 않던 설명을 여기로 옮겼다.
+      // 도구 스키마는 그 예산과 별개로 전달되고, 어차피 이 도구를 쓸 때 필요한 내용이다.
+      "This vault is a SEPARATE store from CLAUDE.md, project docs, or built-in file memory, and is reached only through `recall` — a fact written into CLAUDE.md is not retrievable by `recall` from another project, so storing it here is not duplication. " +
+      "`confidence` and recall accessibility are independent: `confidence` is how likely the memory is TRUE (changed only via `revise`), while how easily it surfaces is computed from frequency and recency. A rarely-recalled memory can still be highly trusted. " +
+      "Memories are stored verbatim and never auto-merged; consolidate only via explicit `revise`.",
     inputSchema: {
       title: z.string().min(1).describe("Short human-readable title (becomes the note filename)"),
       content: z.string().min(1).describe("The memory body in markdown. May contain [[wikilinks]]"),
@@ -282,7 +329,9 @@ server.registerTool(
     title: "Recall (search memories)",
     description:
       "Search the memory vault by keywords. Call this FIRST when starting a task, when the user references past work/preferences, or before answering anything that prior sessions may have covered. " +
-      "Results are ranked by relevance x truthfulness(confidence) x base-level activation (power-law of frequency+recency, ACT-R). Competing near-duplicate memories are laterally inhibited in ranking (retrieval-induced forgetting) — see `inhibited`. Associated (linked) memories are surfaced too. Active recall reinforces the recalled memories.",
+      "Results are ranked by relevance x truthfulness(confidence) x base-level activation (power-law of frequency+recency, ACT-R). Competing near-duplicate memories are laterally inhibited in ranking (retrieval-induced forgetting) — see `inhibited`. Associated (linked) memories are surfaced too. Active recall reinforces the recalled memories.\n" +
+      // instructions 예산 밖으로 밀려나 전달되지 않던 나이 해석 지침을 여기로 옮겼다.
+      "Every result carries `age_days` (days since last update). A memory is a point-in-time observation, not live state: when it cites code, file paths, versions or config and `stale_hint` is present, verify against the current source before asserting it as fact — and `revise` it when reality has moved on.",
     inputSchema: {
       query: z.string().min(1).describe("Keywords to search for (matched against title, tags, description, body)"),
       type: MEMORY_TYPE.optional(),

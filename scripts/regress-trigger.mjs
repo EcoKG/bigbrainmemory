@@ -81,7 +81,7 @@ console.log("1) 기억 인덱스 자동 노출 (E1)");
 
   const { instructions } = await boot(dir);
   check("기본 행동수칙이 유지됨", instructions.includes("RECALL FIRST"));
-  check("인덱스 헤더 노출", /Vault index — 2 memories/.test(instructions), instructions.slice(-400));
+  check("인덱스 헤더 노출", /Vault index \(2 stored\)/.test(instructions), instructions.slice(-400));
   check("1번 기억 제목 노출", instructions.includes("빌드는 corepack pnpm 으로"));
   check("2번 기억 제목 노출", instructions.includes("프로덕션은 I 드라이브"));
   check("설명도 함께 노출", instructions.includes("pnpm 이 PATH 에 없어"));
@@ -102,12 +102,12 @@ console.log("2) 빈 볼트(콜드 스타트) 표기");
   check("콜드 스타트로 명시", /COLD START/i.test(instructions), instructions.slice(-400));
   check(
     "빈 recall 을 '기억 불필요' 로 오해하지 말라는 지시",
-    /NOT evidence that memory is unneeded/i.test(instructions),
+    /NOT evidence memory is unneeded/i.test(instructions),
     instructions.slice(-400),
   );
   check(
     "즉시 저장 행동 지시(끝까지 미루지 말 것)",
-    /rather than deferring to the end of the session/i.test(instructions),
+    /right then, not at the end/i.test(instructions),
     instructions.slice(-400),
   );
   check("행동수칙은 그대로", instructions.includes("RECALL FIRST"));
@@ -121,12 +121,12 @@ console.log("2-b) 빈 볼트 + 프로젝트 스코프");
   check("EMPTY 사실 노출", /vault is EMPTY/i.test(instructions));
   check(
     "스코프 안내가 빈 볼트에서도 실린다",
-    instructions.includes('Current project scope: "acme"'),
+    instructions.includes('Project scope "acme"'),
     instructions.slice(-500),
   );
   check(
     "스코프별 저장 지침도 함께",
-    /omit `project` for knowledge that should follow the user everywhere/.test(instructions),
+    /omit it for knowledge that should follow the user everywhere/.test(instructions),
     instructions.slice(-500),
   );
 }
@@ -139,19 +139,65 @@ console.log("2-c) REMEMBER 이벤트 앵커");
 {
   const dir = freshDir();
   const { instructions } = await boot(dir);
-  check("관측 가능 사건으로 명시", /OBSERVABLE events/.test(instructions), instructions.slice(0, 900));
+  check(
+    "저장 시점이 '세션 끝' 이 아님을 명시",
+    /not at the end of the session/.test(instructions),
+    instructions.slice(0, 900),
+  );
   for (const anchor of [
-    "wrote or edited a durable doc",
+    "edited a durable doc",
     "corrected you",
-    "unfamiliar codebase",
+    "unfamiliar code",
     "non-obvious root cause",
+    "convention or workflow was agreed",
   ]) {
     check(`앵커 포함: ${anchor}`, instructions.includes(anchor));
   }
   check(
     "내장 메모리와 별개 저장소임을 선언",
-    instructions.includes("SEPARATE STORE"),
+    instructions.includes("different store from CLAUDE.md"),
     instructions.slice(0, 1200),
+  );
+}
+
+// ── 2-d. instructions 문자 예산 (클라이언트 절단 방어)
+//
+// 클라이언트는 MCP instructions 를 정확히 2048자에서 말없이 자른다
+// (블록 2079 = 헤더 18 + 본문 2048 + "… [truncated]" 13). 서버는 3268자를
+// 내보내고 있었으므로 37% 가 유실됐고, 하필 배열 맨 끝에 있던 인덱스와
+// COLD START 가 가장 먼저 잘려 **E1 은 설계 이래 한 번도 도달한 적이 없었다.**
+//
+// 기존 회귀 15종이 이를 전부 놓친 이유는 "서버가 내보낸 문자열" 만 검사하고
+// **길이를 재지 않았기** 때문이다. 이 단언이 그 구멍을 막는다.
+const BUDGET = 2048;
+console.log("2-d) instructions 예산 준수");
+{
+  const empty = freshDir();
+  const e = await boot(empty);
+  check(`빈 볼트 ${e.instructions.length}자 ≤ ${BUDGET}`, e.instructions.length <= BUDGET);
+  check("잘렸다면 사라졌을 COLD START 가 살아있음", e.instructions.includes("COLD START"));
+
+  // 볼트가 커져도 예산을 넘지 않고, 행동수칙이 인덱스에 밀려나지 않아야 한다.
+  // remember() 는 호출마다 인덱스를 재생성해 O(n²) 이므로 파일을 직접 쓴다.
+  const big = freshDir();
+  fs.mkdirSync(path.join(big, "memories"), { recursive: true });
+  for (let i = 0; i < 200; i++) {
+    fs.writeFileSync(
+      path.join(big, "memories", `대용량-기억-${i}.md`),
+      `---\nid: mem-big${i}\ntitle: 대용량 기억 ${i} 제목이 제법 길어지는 경우를 가정한다\n` +
+        `description: 이 기억에 대한 한 줄 설명도 짧지 않게 들어간다 ${i}\ntype: semantic\n` +
+        `status: active\nconfidence: 0.8\nstorage_strength: 1\n---\n\n본문.\n`,
+      "utf-8",
+    );
+  }
+  const b = await boot(big);
+  check(`200건 볼트 ${b.instructions.length}자 ≤ ${BUDGET}`, b.instructions.length <= BUDGET);
+  check("행동수칙이 인덱스에 밀려나지 않음 (RECALL)", b.instructions.includes("RECALL FIRST"));
+  check("행동수칙이 인덱스에 밀려나지 않음 (REMEMBER)", b.instructions.includes("2. REMEMBER"));
+  check(
+    "헤더가 자르기 전 총건수(200)를 말함",
+    /Vault index \(200 stored, \d+ most recently updated shown\)/.test(b.instructions),
+    b.instructions.slice(-250),
   );
 }
 
@@ -164,11 +210,11 @@ console.log("3) 인덱스 상한 처리");
     s.remember({ title: `기억 번호 ${i}`, description: `설명 ${i}`, content: `본문 ${i}`, type: "semantic" });
   }
   const { instructions } = await boot(dir, { BIGBRAIN_INDEX_LIMIT: "3" });
-  check("총건수 7 표기", /7 memories stored/.test(instructions), instructions.slice(-400));
+  check("총건수 7 표기", /Vault index \(7 stored/.test(instructions), instructions.slice(-400));
   check("표시건수 3 표기", /3 most recently updated shown/.test(instructions));
   const listed = (instructions.match(/^- \[semantic\] 기억 번호 /gm) ?? []).length;
   check("실제로 3건만 나열", listed === 3, `listed=${listed}`);
-  check("누락분 안내 문구 포함", /anything not listed/.test(instructions));
+  check("나머지는 recall 로 보라는 안내", /use `recall` for the rest/.test(instructions));
 }
 
 // ── 4. 잘못된 볼트 경로가 조용히 넘어가지 않는다 (E3)

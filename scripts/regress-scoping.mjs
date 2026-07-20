@@ -127,8 +127,9 @@ console.log("5) BIGBRAIN_PROJECT 서버 기본 스코프");
   const got = scoped.json.results.map((r) => r.slug);
   check("서버 스코프가 recall 기본값으로 적용됨", !got.includes("베타-빌드-방법"), got.join(","));
   check("자기 프로젝트 + 전역은 반환", got.includes("알파-빌드-방법") && got.includes("공통-빌드-취향"));
-  check("instructions 에 현재 스코프 안내", /Current project scope: "alpha"/.test(scoped.instructions));
-  check("전역 저장 지침도 안내", /omit `project`/.test(scoped.instructions));
+  // 문구는 instructions 2048자 예산에 맞춰 압축됐다 — 의미는 동일하다
+  check("instructions 에 현재 스코프 안내", /Project scope "alpha"/.test(scoped.instructions));
+  check("전역 저장 지침도 안내", /omit it for knowledge that should follow the user everywhere/.test(scoped.instructions));
 
   const escaped = await callRecall({ BIGBRAIN_PROJECT: "alpha" }, { project: "" });
   check("빈 문자열로 전체 검색 가능", escaped.json.results.map((r) => r.slug).includes("베타-빌드-방법"));

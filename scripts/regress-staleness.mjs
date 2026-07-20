@@ -65,9 +65,11 @@ const callJson = async (client, name, args) =>
 // ── 1. recall 결과에 나이가 실린다
 console.log("1) recall 나이 노출 (E4)");
 {
-  const { hits, instructions } = await withClient(async (c) => ({
+  const { hits, recallDesc } = await withClient(async (c) => ({
     hits: (await callJson(c, "recall", { query: "율리시스" })).results,
-    instructions: c.getInstructions() ?? "",
+    // 나이 해석 지침은 instructions 2048자 예산 밖으로 밀려나 전달되지 않았으므로
+    // recall 도구의 description 으로 옮겼다(도구 스키마는 그 예산과 별개로 전달된다).
+    recallDesc: (await c.listTools()).tools.find((t) => t.name === "recall")?.description ?? "",
   }));
   const oldHit = hits.find((h) => h.slug === "낡은-지식");
   const newHit = hits.find((h) => h.slug === "최근-지식");
@@ -79,7 +81,11 @@ console.log("1) recall 나이 노출 (E4)");
   check("최근 기억은 age_days 0", newHit?.age_days === 0, `age=${newHit?.age_days}`);
   check("최근 기억에는 stale_hint 없음", newHit?.stale_hint === undefined, `hint=${newHit?.stale_hint}`);
   check("updated 원본도 함께 노출", typeof oldHit?.updated === "string");
-  check("instructions 에 나이 해석 지침", /age_days/.test(instructions) && /point-in-time/.test(instructions));
+  check(
+    "recall 도구 설명에 나이 해석 지침",
+    /age_days/.test(recallDesc) && /point-in-time/.test(recallDesc),
+    recallDesc.slice(-200),
+  );
 }
 
 // ── 2. read_memory / list_memories 에도 일괄 반영 (brief 공유)
