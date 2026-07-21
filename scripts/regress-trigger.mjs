@@ -63,10 +63,11 @@ async function boot(vaultDir, extraEnv = {}) {
 
 // ── 0. 훅 미설치 감지 (E5)
 //
-// 고정하는 문제: 대조 실험 40회가 SessionStart 훅을 **주 메커니즘**으로 특정했다.
-//   1차(지연 로드) ON 10/10 · OFF 6/10 (p=0.043)
-//   2차(상시 로드) ON 10/10 · OFF 7/10 (p=0.105)
-//   층화검정(CMH, 40회) p=0.0074
+// 고정하는 문제: 대조 실험 60회가 SessionStart 훅을 **주 메커니즘**으로 특정했다.
+//   1차(지연 로드) ON 10/10 · OFF 6/10 (p=0.0433)
+//   2차(상시 로드) ON 10/10 · OFF 7/10 (p=0.1053)
+//   3차(채점판)    ON  9/10 · OFF 4/10 (p=0.0286)
+//   층화검정(CMH, 60회) chi2=11.16, 단측 p=0.00042
 // 그런데 훅 설치는 옵트인이라, 안 깐 사용자는 조용히 35% 를 흘리면서 그 사실조차
 // 모른다. 서버가 훅을 대신할 수는 없으므로(instructions 는 온전히 전달되는데도
 // 행동을 못 만든다) 최선은 **없다는 사실을 크게 말하는 것**이다.
@@ -77,7 +78,7 @@ console.log("0) SessionStart 훅 미설치 감지 (E5)");
   const emptyHome = freshDir();
   const off = await boot(dir, { HOME: emptyHome, USERPROFILE: emptyHome });
   check("미설치면 instructions 에 경고", /SessionStart hook is NOT installed/.test(off.instructions), off.instructions.slice(0, 200));
-  check("근거(20/20 vs 13/20)를 함께 제시", /20\/20/.test(off.instructions) && /13\/20/.test(off.instructions));
+  check("근거(29/30 vs 17/30)를 함께 제시", /29\/30/.test(off.instructions) && /17\/30/.test(off.instructions));
   check("조치 방법을 지시", /npm run setup:hook/.test(off.instructions));
   check("스스로 보완하라는 지시", /`recall` now and `remember` as soon as a trigger fires/.test(off.instructions), off.instructions.slice(-300));
   check("사람도 보게 stderr 에도 출력", /setup:hook/.test(off.stderr), off.stderr.slice(0, 300));
@@ -101,6 +102,39 @@ console.log("0) SessionStart 훅 미설치 감지 (E5)");
   // 끄고 싶은 사용자를 위한 탈출구
   const opted = await boot(dir, { HOME: emptyHome, USERPROFILE: emptyHome, BIGBRAIN_HOOK_CHECK: "0" });
   check("BIGBRAIN_HOOK_CHECK=0 이면 검사 자체를 끔", !/SessionStart hook is NOT installed/.test(opted.instructions));
+}
+
+// ── 0-b. 예산이 빠듯해도 볼트 상태가 통째로 사라지지 않는다 (E6)
+//
+// 고정하는 회귀: 상태 블록(COLD START·스코프 안내) 적재가 all-or-nothing 이었다.
+// essential + state 가 1자라도 넘치면 state 전체를 버렸고, 최종 길이는 예산 미달이라
+// 초과 경고도 울리지 않아 **조용히** 사라졌다. 하필 빈 볼트 + 경고 2개가 다 붙은
+// 최악 구성에서만 발생해, e315656 이 고친 "콜드 스타트 침묵" 이 그 조건에서 부활했다.
+// 실측(패치 전): 긴 경로 + 볼트 경고 + 훅 경고 = 1818자인데 COLD START 탈락.
+console.log("0-b) 예산 압박 시 볼트 상태 단계적 축약 (E6)");
+{
+  const emptyHome = freshDir();
+  // 경로를 길게 만들어 VAULT_WARNING 을 부풀린다 — 예산을 미는 유일한 가변 요소다
+  const deep = path.join(freshDir(), "a".repeat(60), "nested", "deeply", "vault");
+  fs.mkdirSync(deep, { recursive: true });
+  const worst = await boot(deep, {
+    HOME: emptyHome,
+    USERPROFILE: emptyHome,
+    BIGBRAIN_PROJECT: "aVeryLongProjectNameToSqueezeTheBudget",
+  });
+  check(`최악 구성 ${worst.instructions.length}자 ≤ 2048`, worst.instructions.length <= 2048);
+  check("경고 2개가 모두 살아 있음", /WARNING: BIGBRAIN_VAULT/.test(worst.instructions) && /hook is NOT installed/.test(worst.instructions));
+  // ★ 이 단언이 패치 전 실패한다 — 축약형이 없으면 COLD START 가 통째로 빠졌다
+  check("COLD START 는 축약해서라도 남는다", /COLD START/.test(worst.instructions), worst.instructions.slice(-400));
+  check("행동수칙은 어떤 경우에도 온전", /1\. RECALL FIRST/.test(worst.instructions) && /5\. REFLECT/.test(worst.instructions));
+  // ★ 침묵 제거 — 버렸으면 예산 안에 들어왔더라도 사람이 알아야 한다
+  check("무엇을 줄였는지 stderr 로 보고", /볼트 상태를 줄였습니다/.test(worst.stderr), worst.stderr.slice(0, 300));
+
+  // 여유가 있으면 축약하지 않는다 — 축약이 상시 동작이 되면 안 된다
+  const roomy = freshDir();
+  const ok = await boot(roomy, { BIGBRAIN_PROJECT: "p" });
+  check("여유 있으면 전문 그대로", /vault is EMPTY \(0 memories\)/.test(ok.instructions) && /recall returns this project's memories/.test(ok.instructions));
+  check("여유 있으면 축약 보고 없음", !/볼트 상태를 줄였습니다/.test(ok.stderr));
 }
 
 // ── 1. 인덱스가 instructions 에 실린다 (E1)

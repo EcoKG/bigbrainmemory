@@ -305,6 +305,38 @@ console.log("6) 경고 빈도 — Stop 은 매 턴 발화한다");
   run(["--start", "--vault-force", v4], root, startEvent({ session_id: "S4", source: "startup" }));
   const gone = run(["--stop", "--vault-force", v4], root, stopEvent({ session_id: "S4", transcript_path: path.join(root, "없음.jsonl") }));
   check("트랜스크립트가 없어도 경고(게이트 통과)", /저장된 기억이 없습니다/.test(gone.out), gone.out.slice(0, 200));
+
+  // 서브에이전트 위임 세션은 부모 트랜스크립트에 흔적이 거의 없다 — 실제 작업은
+  // 별도 컨텍스트에서 벌어졌는데 부모 기준으로는 잡담처럼 보여 게이트에 걸린다.
+  // 위임을 침묵시키면 위임 경로의 저장률을 잴 수단 자체가 사라진다.
+  const v5 = makeVault(root, "N5", 1);
+  const tpAgent = path.join(root, "t-agent.jsonl");
+  fs.writeFileSync(tpAgent, '{"type":"tool_use","name":"Agent","input":{}}\n', "utf-8"); // 도구 1회 = 게이트 미만
+  run(["--start", "--vault-force", v5], root, startEvent({ session_id: "S5", source: "startup" }));
+  const delegated = run(["--stop", "--vault-force", v5], root, stopEvent({ session_id: "S5", transcript_path: tpAgent }));
+  check("서브에이전트에 위임한 세션도 경고 대상", /저장된 기억이 없습니다/.test(delegated.out), delegated.out.slice(0, 200));
+}
+
+// ── 6-b. 인덱스 절단을 숨기지 않는다 (H8)
+//
+// MAX_LINES=200 에서 조용히 잘렸다. 모델은 주입된 것이 볼트 전부라고 읽고
+// 안 보이는 기억을 찾지 않는다 — 잘린 것과 없는 것이 구분되지 않는다.
+console.log("6-b) 인덱스 절단 표시");
+{
+  const root = freshDir("trunc");
+  const v = makeVault(root, "T", 300);
+  fs.writeFileSync(path.join(v, "MEMORY.md"), Array.from({ length: 400 }, (_, i) => `- 항목 ${i}`).join("\n"), "utf-8");
+  const big = run(["--start", "--vault-force", v], root, startEvent({ session_id: "T1", source: "startup" }));
+  check("절단 사실을 명시", /index truncated at 200 lines/.test(big.out), big.out.slice(-300));
+  check("전체 건수를 함께 알림", /300 memories are stored in total/.test(big.out), big.out.slice(-300));
+  check("나머지 도달 경로를 안내", /reachable only via recall/.test(big.out), big.out.slice(-300));
+  check("절단선 이후는 실리지 않음", !big.out.includes("- 항목 250"));
+
+  // 안 잘렸으면 군더더기를 붙이지 않는다
+  const small = makeVault(root, "S", 3);
+  fs.writeFileSync(path.join(small, "MEMORY.md"), "- 하나\n- 둘\n- 셋", "utf-8");
+  const fits = run(["--start", "--vault-force", small], root, startEvent({ session_id: "T2", source: "startup" }));
+  check("짧은 인덱스에는 절단 문구 없음", !/truncated/.test(fits.out), fits.out.slice(0, 300));
 }
 
 // ── 7. stdin 이 없거나 깨져도 멈추지 않는다 (H7)

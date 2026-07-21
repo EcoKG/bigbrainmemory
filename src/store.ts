@@ -413,7 +413,7 @@ export class MemoryStore {
     return verify(this.buildIdIndex().get(idOrSlug));
   }
 
-  remember(input: RememberInput): { record: MemoryRecord; similar: MemoryRecord[] } {
+  remember(input: RememberInput): { record: MemoryRecord; similar: MemoryRecord[]; dangling: string[] } {
     const now = nowIso();
     const slug = this.vault.makeSlug(input.title);
     const record: MemoryRecord = {
@@ -472,7 +472,8 @@ export class MemoryStore {
     }
 
     this.regenerateIndex();
-    return { record: this.vault.read(finalSlug) ?? record, similar };
+    const stored = this.vault.read(finalSlug) ?? record;
+    return { record: stored, similar, dangling: this.danglingLinks(stored) };
   }
 
   /**
@@ -722,6 +723,8 @@ export class MemoryStore {
     lowConfidence: MemoryRecord[];
     duplicates: [string, string][];
     orphans: MemoryRecord[];
+    /** 존재하지 않는 슬러그를 가리키는 위키링크 — 연결이 끊긴 채 방치된 기억 */
+    danglingLinks: { slug: string; targets: string[] }[];
   } {
     const all = this.loadAll(true);
     const byType: Record<string, number> = {};
@@ -776,6 +779,9 @@ export class MemoryStore {
       }
     }
     const orphans = active.filter((m) => m.links.length === 0);
+    const danglingLinks = active
+      .map((m) => ({ slug: m.slug, targets: this.danglingLinks(m) }))
+      .filter((x) => x.targets.length > 0);
     return {
       counts: { total: all.length, byType, byStatus },
       weakened,
@@ -784,6 +790,7 @@ export class MemoryStore {
       lowConfidence,
       duplicates,
       orphans,
+      danglingLinks,
     };
   }
 
@@ -863,8 +870,13 @@ export class MemoryStore {
     // 간격 게이트가 닫혀 있으면 저장강도가 안 오르므로, 디스크에 반영할 실질 변화가
     // accessCount/lastAccessed 뿐이다. 이 둘은 활성 계산에 쓰이지 않는 표시용 필드인데
     // 매 조회마다 파일을 통째로 재직렬화하면 git/Obsidian/백업이 조회만으로 변경을
-    // 감지하고, 비원자 구간을 불필요하게 자주 연다(감사 B). 게이트가 열릴 때 함께
-    // 반영되므로 여기서는 쓰기를 생략한다.
+    // 감지하고, 비원자 구간을 불필요하게 자주 연다(감사 B). 그래서 쓰기를 생략한다.
+    //
+    // **생략한 조회는 나중에도 반영되지 않는다.** 아래 875행은 게이트가 열릴 때
+    // accessCount 를 +1 할 뿐 그동안 건너뛴 횟수를 누적하지 않는다. 즉 디스크의
+    // accessCount 는 "조회 횟수" 가 아니라 "게이트가 열린 채 조회된 횟수" 다.
+    // 의도된 성능 절충이지만, 그래서 **회상 빈도를 재는 지표로는 못 쓴다** —
+    // 계측이 필요하면 BIGBRAIN_FLUSH_EVERY_ACCESS=1 로 켜야 한다.
     if (delta === 0 && !FLUSH_EVERY_ACCESS) return;
 
     try {
@@ -891,6 +903,34 @@ export class MemoryStore {
     this.appendBodyLink(m, targetSlug, relation);
     m.updated = nowIso();
     this.vault.write(m, archived);
+  }
+
+  /**
+   * 본문·links 가 가리키는 슬러그 중 **볼트에 없는 것**을 돌려준다 (깨진 위키링크).
+   *
+   * 왜 필요한가 — 모델은 주입된 인덱스나 기억나는 이름을 보고 `[[슬러그]]` 를 본문에
+   * 그냥 쓴다. 그런데 그 이름이 존재한다는 보장이 어디에도 없다. 특히 볼트 A 의
+   * 인덱스가 컨텍스트에 있는 상태에서 볼트 B 에 저장하면 통째로 깨진다.
+   * 실볼트 관측: 기억 2건짜리 볼트에 이미 깨진 링크 1건이 들어 있었다.
+   *
+   * **차단하지 않고 보고만 한다.** 아직 안 쓴 기억을 미리 가리키는 선행 참조는
+   * 정상적인 사용법이고(그래서 remember 설명이 링크를 권장한다), 저장을 막으면
+   * 그 정상 경로까지 죽는다. 모델이 알고 고치게 하는 것이 목적이다.
+   */
+  private danglingLinks(m: MemoryRecord): string[] {
+    let known: Set<string>;
+    try {
+      known = new Set(this.vault.listSlugs(true).map((s) => s.slug));
+    } catch {
+      return []; // 볼트를 못 읽으면 판정하지 않는다 — 오탐이 침묵보다 나쁘다
+    }
+    const targets = new Set<string>(m.links);
+    for (const mt of m.body.matchAll(/\[\[([^\]|#]+)/g)) targets.add(mt[1].trim());
+    return [...targets]
+      // 인덱스(MEMORY.md)가 쓰는 `memories/<slug>` 표기도 같은 대상으로 본다
+      .map((t) => t.replace(/^memories\//, ""))
+      .filter((t) => t !== "" && t !== m.slug && !known.has(t))
+      .sort();
   }
 
   /** frontmatter의 links 배열 기준으로 본문에 빠진 위키링크를 복원 */

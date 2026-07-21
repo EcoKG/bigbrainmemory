@@ -311,7 +311,13 @@ if (mode === "start") {
   try {
     // BOM 제거 — 주입되는 컨텍스트 첫머리에 보이지 않는 문자가 섞이지 않게 한다
     const md = fs.readFileSync(path.join(vaultDir, "MEMORY.md"), "utf-8").replace(/^﻿/, "");
-    body = md.split(/\r?\n/).slice(0, MAX_LINES).join("\n").trimEnd();
+    const lines = md.split(/\r?\n/);
+    body = lines.slice(0, MAX_LINES).join("\n").trimEnd();
+    // **잘랐으면 잘랐다고 말한다.** 말없이 자르면 모델은 주입된 것이 볼트 전부라고
+    // 읽고, 안 보이는 기억을 찾지 않는다 — 없는 것과 구분이 안 된다.
+    if (lines.length > MAX_LINES) {
+      body += `\n\n(index truncated at ${MAX_LINES} lines — ${count} memories are stored in total; the rest are reachable only via recall)`;
+    }
   } catch {
     /* 인덱스 파일이 없거나 못 읽음 — 아래에서 건수만으로 대체한다 */
   }
@@ -360,7 +366,13 @@ if (hookInput.transcriptPath && MIN_TOOL_USES > 0) {
   try {
     const raw = fs.readFileSync(hookInput.transcriptPath, "utf-8");
     const uses = (raw.match(/"type"\s*:\s*"tool_use"/g) ?? []).length;
-    if (uses < MIN_TOOL_USES) process.exit(0);
+    // 서브에이전트에 위임한 세션은 **부모 트랜스크립트에 호출 흔적이 거의 없다.**
+    // 실제 작업은 별도 컨텍스트에서 벌어졌는데 부모 기준으로는 한두 번 부른 잡담처럼
+    // 보여 게이트에 걸린다. 위임 자체를 작업 신호로 취급해 게이트를 통과시킨다.
+    // (위임이 저장을 억제하는지는 아직 미측정이다 — 여기서 침묵하면 그 측정 자체가
+    //  오염되므로, 제품 효과가 아니라 관측 가능성을 위해 넣는다)
+    const delegated = /"name"\s*:\s*"(Agent|Task)"/.test(raw);
+    if (uses < MIN_TOOL_USES && !delegated) process.exit(0);
   } catch {
     /* 못 읽음 — 게이트를 통과시킨다 */
   }

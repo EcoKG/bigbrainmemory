@@ -106,13 +106,13 @@ source: 코드 리뷰 대화
 
 | 도구 | 파라미터 | 비고 |
 |---|---|---|
-| `remember` | `title` `content` `type` / `description` `tags` `links` `confidence` `source` `project` `supersedes` | 유사 기억이 있으면 `similar_existing_memories`로 알려 중복 대신 `revise`를 유도. **`project`를 생략하면 전역 기억**이 됩니다(서버 스코프를 자동으로 씌우지 않음) |
+| `remember` | `title` `content` `type` / `description` `tags` `links` `confidence` `source` `project` `supersedes` | 유사 기억이 있으면 `similar_existing_memories`로 알려 중복 대신 `revise`를 유도. 본문의 `[[위키링크]]`가 없는 슬러그를 가리키면 `broken_links`로 알립니다(**차단하지 않음** — 선행 참조는 정상). **`project`를 생략하면 전역 기억**이 됩니다(서버 스코프를 자동으로 씌우지 않음) |
 | `recall` | `query` / `type` `limit`(1~20, 기본 5) `include_linked`(기본 true) `project` | 응답에 `total_matched`(컷오프 전 총 건수)와 잘렸을 때 `truncated` 안내. 결과별로 `score` `activation` `inhibited` `snippet`. 0건이면 재질의를 유도하는 `note` |
 | `read_memory` | `id` (슬러그 또는 id) | 전문(`body`)과 `history`까지. 읽으면 강화되지만 능동 회상보다 약합니다 |
 | `revise` | `id` `reason` / `content` `title` `description` `tags` `confidence` `source` `project` | 사유 필수(이력에 기록). `project: ""`로 전역으로 되돌릴 수 있습니다 |
 | `forget` | `id` `reason` | `archive/`로 이동, 사유 기록 |
 | `link` | `source` `target` / `relation` | 양방향 위키링크. `relation`은 본문 `## 연관 기억`에 라벨로 남습니다 |
-| `reflect` | (없음) | `weakened_hard_to_recall` · `forget_candidates` · **`trusted_but_faded`**(약해졌지만 확신도가 높아 후보에서 제외된 건수) · `low_confidence` · `possible_duplicates` · `orphans_without_links` |
+| `reflect` | (없음) | `weakened_hard_to_recall` · `forget_candidates` · **`trusted_but_faded`**(약해졌지만 확신도가 높아 후보에서 제외된 건수) · `low_confidence` · `possible_duplicates` · `orphans_without_links` · **`broken_links`**(없는 슬러그를 가리키는 위키링크) |
 | `list_memories` | `type` `status`(active/superseded/archived) `project` | 최근 갱신순 |
 
 서버 `instructions`에는 행동 수칙(recall 먼저 → remember → 모순되면 revise/forget → 주기적 reflect)에 더해 **기억 인덱스**, 프로젝트 스코프 안내, 나이 해석 지침이 함께 실립니다.
@@ -246,9 +246,17 @@ claude mcp add --scope user -e BIGBRAIN_VAULT="C:/Users/me/MyObsidianVault/BigBr
 
 인덱스가 가장 먼저 양보하는 이유는 **채널 ②(SessionStart 훅)가 길이 제한 없이 같은 역할을 하기 때문**입니다. 정적 설명(확신도 축 구분, 나이 해석 등)은 도구 `description`으로 옮겼습니다 — 도구 스키마는 이 예산과 별개로 전달됩니다. `BIGBRAIN_INSTRUCTIONS_BUDGET`으로 조정할 수 있습니다.
 
+3번(볼트 상태)은 **블록 단위로 전문 → 축약 순서로** 싣습니다. 종전에는 all-or-nothing이라, 예산이 30자 모자라면 272자짜리 COLD START가 통째로 사라졌습니다 — 그것도 조용히(최종 길이는 예산 미달이라 초과 경고가 울리지 않음). 하필 **빈 볼트 + 볼트 경고 + 훅 경고**가 겹친 최악 구성에서만 발생해서, "콜드 스타트 침묵" 수정이 그 조건에서만 되살아나 있었습니다(실측: 1818자인데 COLD START 탈락). 지금은 축약형으로라도 반드시 남고, **무엇을 줄였는지 stderr로 보고**합니다. 예산 안에 들어왔더라도 버린 게 있으면 말합니다 — 그 침묵이 회귀를 숨겼기 때문입니다.
+
+> 줄 단위 부분 적재로는 이 문제가 안 풀립니다. COLD START는 한 줄짜리 262자 블록이라, 남은 230자에 "일부만" 실을 방법이 없습니다. 그래서 블록마다 축약형을 따로 둡니다.
+
 볼트가 비어 있으면(콜드 스타트) 인덱스로 노출할 것이 없으므로, 그 자리를 **행동 지시로 대체**합니다 — "빈 `recall` 결과는 기억이 불필요하다는 증거가 아니다", "트리거가 걸리면 세션 끝까지 미루지 말고 그 즉시 저장하라". 종전에는 이 상황에서 한 문장만 나가고 스코프 안내마저 빠졌는데, 설득이 가장 필요한 시점에 가장 약하게 말하는 역전이었습니다.
 
 **② 세션 훅 (항상 최신 + 무저장 감지) — 명령 한 번으로 설치**
+
+> **이 채널이 선택 사항이 아니라 주 메커니즘입니다.** 헤드리스 대조 실험 60회에서 저장률이 **훅 ON 29/30(97%) vs 훅 OFF 17/30(57%)** 로 갈렸습니다(라운드 3개 층화검정 CMH χ²=11.16, 단측 p=0.00042). 채널 ①(`instructions`)만으로는 부족합니다 — 잘리지 않고 온전히 전달된 회차에서도 행동이 나오지 않았습니다. 훅 출력은 **대화 컨텍스트**에 블록으로 들어가고 `instructions`는 서버 메타데이터로 들어가는데, 그 차이가 실제 행동 차이를 만듭니다. MCP에는 대화 컨텍스트에 자동 주입되는 채널이 없습니다(`prompts`·`resources`는 호출해야 합니다). 그래서 훅이 없으면 서버가 `instructions` 첫머리에 **미설치 경고를 띄웁니다**(`BIGBRAIN_HOOK_CHECK=0`으로 끔).
+>
+> 한계: 전부 헤드리스(`claude -p`) · 단일 과제 기준이며, 라운드 사이에 다른 커밋이 섞여 있어 완전한 단일 변수 비교는 아닙니다. 대화형에서 같은 크기의 효과가 나오는지는 미측정입니다.
 
 ```bash
 npm run setup:hook                    # 설치 (백업 후 적용)
@@ -321,7 +329,9 @@ stdin은 **250ms 타임아웃**으로 읽습니다. Stop은 매 턴 실행되므
 
 `postinstall`로 자동 실행하지 않는 이유: 전역 설정을 몰래 고치는 것은 나쁜 관행이고, Claude Code를 쓰지 않는 사용자나 CI에서도 실행되어 버립니다.
 
-`UserPromptSubmit`이 아니라 `SessionStart`를 쓰는 이유: 전자는 매 턴 중복 주입돼 컨텍스트를 낭비합니다. 주입은 최대 200줄로 잘라 볼트가 커져도 예산을 넘지 않게 합니다.
+`UserPromptSubmit`이 아니라 `SessionStart`를 쓰는 이유: 전자는 매 턴 중복 주입돼 컨텍스트를 낭비합니다. 주입은 최대 200줄로 잘라 볼트가 커져도 예산을 넘지 않게 합니다 — **잘렸으면 잘렸다고 블록 끝에 명시합니다**(총 건수 + "나머지는 recall로만 도달"). 말없이 자르면 모델은 주입된 것이 볼트 전부라고 읽고, 안 보이는 기억을 아예 찾지 않습니다.
+
+Stop 훅의 무저장 경고는 실제로 작업한 세션에만 나갑니다(도구 호출 3회 이상, `BIGBRAIN_STOP_MIN_TOOLS`로 조정). **서브에이전트에 위임한 세션은 예외로 통과시킵니다** — 실제 작업이 별도 컨텍스트에서 벌어져 부모 트랜스크립트에는 호출 흔적이 거의 없기 때문입니다. 위임이 저장을 억제하는지는 아직 측정된 바 없지만, 여기서 침묵하면 그 측정 자체가 불가능해집니다.
 
 **③ 네이티브 메모리 브리지**
 Claude Code의 프로젝트별 메모리(`~/.claude/projects/<프로젝트>/memory/MEMORY.md`)는 매 세션 자동 주입됩니다. 이 파일에 "장기 기억은 bigbrainmemory의 `recall`로 조회"라는 안내와 핵심 항목 목록을 남겨두면 네이티브의 자동 주입에 편승할 수 있습니다. 프로젝트 단위로 다른 안내를 주고 싶을 때 유용합니다.

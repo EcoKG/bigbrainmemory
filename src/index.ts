@@ -41,12 +41,14 @@ const VAULT_WARNING = computeVaultWarning();
 /**
  * SessionStart 훅이 설치돼 있는지 본다.
  *
- * 왜 서버가 훅 설치 여부까지 신경 쓰는가 — 40회 대조 실험이 훅을 **주 메커니즘**으로
+ * 왜 서버가 훅 설치 여부까지 신경 쓰는가 — 60회 대조 실험이 훅을 **주 메커니즘**으로
  * 특정했기 때문이다:
- *   1차(지연 로드)    ON 10/10  OFF  6/10   p=0.043
- *   2차(상시 로드)    ON 10/10  OFF  7/10   p=0.105
- *   층화(CMH, 40회)                          p=0.0074
- * 두 라운드에서 방향이 일치했고, 훅이 없으면 저장률이 65% 로 떨어진다.
+ *   1차(지연 로드)    ON 10/10  OFF  6/10   Fisher 단측 p=0.0433
+ *   2차(상시 로드)    ON 10/10  OFF  7/10                p=0.1053
+ *   3차(채점판)       ON  9/10  OFF  4/10                p=0.0286
+ *   층화(CMH, 60회)                          chi2=11.16, 단측 p=0.00042
+ * 라운드마다 조건이 달랐으므로 단순 통합(p=0.00022)이 아니라 층화값을 보고한다.
+ * 세 라운드에서 방향이 일치했고, 훅이 없으면 저장률이 97% → 57% 로 떨어진다.
  *
  * 결정적으로 **서버는 이 역할을 대신할 수 없다.** instructions 는 온전히 전달되는데도
  * (1485자, 무절단) 행동을 만들지 못했다. 훅 출력은 대화 컨텍스트에 블록으로 들어가는
@@ -73,8 +75,8 @@ function computeHookWarning(): string | null {
     }
   }
   return (
-    "NOTE: the BigBrainMemory SessionStart hook is NOT installed. In 40 controlled trials sessions saved " +
-    "20/20 with it vs 13/20 without — these instructions alone often fail. Ask the user to run " +
+    "NOTE: the BigBrainMemory SessionStart hook is NOT installed. In 60 controlled trials sessions saved " +
+    "29/30 with it vs 17/30 without — these instructions alone often fail. Ask the user to run " +
     "`npm run setup:hook`; until then, `recall` now and `remember` as soon as a trigger fires."
   );
 }
@@ -137,7 +139,18 @@ const DEFAULT_PROJECT = process.env.BIGBRAIN_PROJECT?.trim() || undefined;
  * `total` 은 INDEX_LIMIT/예산으로 자르기 **전** 의 실제 건수다 — 헤더가 총계를
  * 잘못 말하면 모델이 "이게 전부" 라고 오해한다.
  */
-function vaultState(): { state: string[]; items: string[]; total: number } {
+/**
+ * 볼트 상태 한 블록. `full` 이 안 들어가면 `short` 로라도 싣는다.
+ *
+ * 왜 축약형을 따로 들고 다니는가 — 종전에는 상태 블록 전체가 all-or-nothing 이라,
+ * 예산이 30자 모자라면 272자짜리 COLD START 가 통째로 사라졌다. 그것도 조용히.
+ * 하필 **가장 필요한 상황**(빈 볼트 + 경고 2개가 다 붙은 최악 구성)에서만 사라져,
+ * e315656 이 고친 "콜드 스타트 침묵" 이 그 조건에서 되살아났다.
+ * 실측: 긴 경로 + 볼트 경고 + 훅 경고 = 1818자(예산 2048)인데 COLD START 탈락.
+ */
+type StateBlock = { full: string; short: string };
+
+function vaultState(): { state: StateBlock[]; items: string[]; total: number } {
   let list: ReturnType<typeof store.list>;
   try {
     list = store.list(DEFAULT_PROJECT ? { project: DEFAULT_PROJECT } : undefined);
@@ -147,33 +160,35 @@ function vaultState(): { state: string[]; items: string[]; total: number } {
     // 빈 배열을 돌려주면 모델은 기억 상태 신호를 하나도 못 받는다 — 실패 사실이라도 전한다
     return {
       state: [
-        `NOTE — the vault index could not be built (${detail}). The tools still work; you just cannot see an up-front list.`,
-        "Do NOT infer the vault is empty: call `recall` before concluding anything is missing.",
+        {
+          full: `NOTE — the vault index could not be built (${detail}). The tools still work; you just cannot see an up-front list. Do NOT infer the vault is empty: call \`recall\` before concluding anything is missing.`,
+          short: "NOTE — the vault index could not be built. Do NOT infer the vault is empty; call `recall` first.",
+        },
       ],
       items: [],
       total: 0,
     };
   }
 
-  const scope = DEFAULT_PROJECT
-    ? [
-        `Project scope "${DEFAULT_PROJECT}": recall returns this project's memories plus global ones. When storing, set \`project\` for facts only true here; omit it for knowledge that should follow the user everywhere.`,
-      ]
-    : [];
-
+  // 우선순위 순으로 담는다 — 예산이 모자라면 뒤쪽부터 축약/탈락한다.
+  // COLD START 가 스코프 안내보다 앞이다: 전자는 저장 행동을 만들고, 후자는 저장할 때의 분류다.
+  const state: StateBlock[] = [];
   if (list.length === 0) {
-    return {
-      state: [
-        ...scope,
-        "COLD START — this vault is EMPTY (0 memories). `recall` will return nothing; that is expected on a fresh vault and is NOT evidence memory is unneeded. Seeding it is part of this session's job: when a REMEMBER trigger fires, call `remember` right then, not at the end.",
-      ],
-      items: [],
-      total: 0,
-    };
+    state.push({
+      full: "COLD START — this vault is EMPTY (0 memories). `recall` will return nothing; that is expected on a fresh vault and is NOT evidence memory is unneeded. Seeding it is part of this session's job: when a REMEMBER trigger fires, call `remember` right then, not at the end.",
+      short: "COLD START — vault is EMPTY (0). Not evidence memory is unneeded; `remember` as soon as a trigger fires.",
+    });
   }
-  if (INDEX_LIMIT === 0) return { state: scope, items: [], total: list.length };
+  if (DEFAULT_PROJECT) {
+    state.push({
+      full: `Project scope "${DEFAULT_PROJECT}": recall returns this project's memories plus global ones. When storing, set \`project\` for facts only true here; omit it for knowledge that should follow the user everywhere.`,
+      short: `Project scope "${DEFAULT_PROJECT}": set \`project\` for local-only facts, omit it for global knowledge.`,
+    });
+  }
+
+  if (list.length === 0 || INDEX_LIMIT === 0) return { state, items: [], total: list.length };
   return {
-    state: scope,
+    state,
     items: list.slice(0, INDEX_LIMIT).map((m) => `- [${m.type}] ${m.title} — ${m.description}`),
     total: list.length,
   };
@@ -211,9 +226,21 @@ function buildInstructions(): string {
 
   // 볼트 상태 설명(COLD START·스코프 안내)은 경고·수칙보다 낮은 우선순위다.
   // **머리 부분만으로 예산이 찰 수 있다** — 경고가 붙는 최악의 경우가 그렇다.
-  // 그때 인덱스만 잘라봐야 소용없으므로, 상태 설명을 먼저 버린다. 이 방어가 없으면
-  // 예산 초과분이 클라이언트에서 잘려나가고, 하필 맨 뒤의 지시부터 사라진다.
-  const head = [...essential, ...state].join("\n").length <= INSTRUCTIONS_BUDGET ? [...essential, ...state] : essential;
+  //
+  // 종전에는 여기서 상태 전체를 버렸다(all-or-nothing). 그게 회귀였다: 예산이
+  // 230자 남았는데 272자짜리 블록 하나가 안 들어간다고 통째로 버렸고, 최종 길이는
+  // 예산 미달이라 아래 초과 경고도 울리지 않아 **조용히** 사라졌다.
+  // 이제 블록 단위로 full → short 순서로 넣고, 무엇이 줄었는지 반드시 보고한다.
+  const head = [...essential];
+  const degraded: string[] = [];
+  for (const block of state) {
+    const fits = (s: string) => [...head, s].join("\n").length <= INSTRUCTIONS_BUDGET;
+    if (fits(block.full)) head.push(block.full);
+    else if (fits(block.short)) {
+      head.push(block.short);
+      degraded.push(`축약: ${block.full.slice(0, 24)}…`);
+    } else degraded.push(`탈락: ${block.full.slice(0, 24)}…`);
+  }
 
   // 헤더는 자르기 **전** 총건수(total)를 말한다 — INDEX_LIMIT/예산으로 줄어든 수를
   // 총계로 쓰면 모델이 "이게 전부" 라고 오해해 없는 기억을 찾지 않는다.
@@ -238,6 +265,13 @@ function buildInstructions(): string {
     // 고정부만으로 예산을 넘는 경우 — 잘림을 클라이언트에 맡기지 않고 알린다
     console.error(
       `[BigBrainMemory] instructions ${text.length}자 — 예산 ${INSTRUCTIONS_BUDGET} 초과. 클라이언트가 뒷부분을 자를 수 있습니다.`,
+    );
+  }
+  // 예산 안에 들어왔더라도 **무언가를 버렸으면 말한다.** 최종 길이만 보고 판단하면
+  // 버린 덕분에 예산에 들어온 경우가 정상으로 보인다 — 그 침묵이 위 회귀를 6주간 숨겼다.
+  if (degraded.length > 0) {
+    console.error(
+      `[BigBrainMemory] instructions 예산 ${INSTRUCTIONS_BUDGET}자에 맞추려고 볼트 상태를 줄였습니다 (${text.length}자): ${degraded.join(", ")}`,
     );
   }
   return text;
@@ -389,14 +423,22 @@ server.registerTool(
     // project 를 생략하면 전역 기억이다 — 서버 스코프를 몰래 씌우지 않는다.
     // (씌우면 "전역이면 생략" 이라는 도구 설명과 모순되고, 사용자 선호 같은
     //  범용 지식이 한 프로젝트에 갇혀 다른 곳에서 조용히 회상되지 않는다)
-    const { record, similar } = store.remember(args);
+    const { record, similar, dangling } = store.remember(args);
+    // 깨진 링크는 **보고만** 한다 — 아직 안 쓴 기억을 미리 가리키는 선행 참조는
+    // 정상이므로 저장을 막으면 안 된다. 다만 모르고 지나가면 볼트가 조용히 썩는다.
+    const hints = [
+      similar.length > 0
+        ? "Similar memories exist. If this duplicates one of them, call `forget` on this new memory and `revise` the existing one instead."
+        : null,
+      dangling.length > 0
+        ? `Broken wikilinks (no such memory): ${dangling.map((d) => `[[${d}]]`).join(", ")}. Either \`remember\` those, or \`revise\` this body to remove them — do not leave links pointing at nothing.`
+        : null,
+    ].filter((x): x is string => x !== null);
     return ok({
       stored: brief(record),
       similar_existing_memories: similar.filter((m) => m.slug !== record.slug).map(brief),
-      hint:
-        similar.length > 0
-          ? "Similar memories exist. If this duplicates one of them, call `forget` on this new memory and `revise` the existing one instead."
-          : undefined,
+      broken_links: dangling.length > 0 ? dangling : undefined,
+      hint: hints.length > 0 ? hints.join(" ") : undefined,
     });
   },
 );
@@ -556,8 +598,12 @@ server.registerTool(
       low_confidence: r.lowConfidence.map((m) => ({ slug: m.slug, title: m.title, confidence: m.confidence })),
       possible_duplicates: r.duplicates,
       orphans_without_links: r.orphans.map((m) => m.slug),
+      broken_links: r.danglingLinks,
       suggestion:
-        "Review forget_candidates and `forget` the ones that are truly obsolete/wrong (reversible — moved to archive). Revise low-confidence memories if you can confirm or correct them. Merge duplicates (revise one, forget the other). Link orphans to related memories.",
+        "Review forget_candidates and `forget` the ones that are truly obsolete/wrong (reversible — moved to archive). Revise low-confidence memories if you can confirm or correct them. Merge duplicates (revise one, forget the other). Link orphans to related memories." +
+        (r.danglingLinks.length > 0
+          ? " broken_links point at slugs that do not exist — either `remember` the missing memory or `revise` the body to drop the link."
+          : ""),
     });
   },
 );
