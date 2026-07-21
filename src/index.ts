@@ -25,6 +25,17 @@ const store = new MemoryStore(vault);
  * 모두 알아채게 한다. (BIGBRAIN_VAULT 를 지정하지 않은 첫 실행은 정상이므로 제외)
  */
 function computeVaultWarning(): string | null {
+  // 네이티브 메모리 디렉터리 오지정 — 마커보다 **먼저** 본다.
+  // 마커 뒤에 두면 1회차에 박힌 마커가 2회차부터 이 경고를 삼켜, 사고가 사고를 은폐한다.
+  // 문구도 오타 의심이 아니라 실제 상황을 말해야 한다 — 경로는 정확하고, 형식이 다르다.
+  const native = vault.nativeMemoryFiles;
+  if (native.length > 0) {
+    return (
+      `WARNING: "${vaultDir}" is a Claude Code NATIVE memory directory (${native.length} notes at its root), not a BigBrainMemory vault. ` +
+      `BigBrainMemory keeps memories in a \`memories/\` subfolder, so it reads 0 here — those notes are NOT lost, just invisible. ` +
+      `Its own MEMORY.md is left untouched. Tell the user to run \`npm run import:native\` (preview) then \`-- --apply\`, and point BIGBRAIN_VAULT at a separate vault directory.`
+    );
+  }
   const st = vault.inspect();
   if (st.memories > 0 || st.archived > 0) return null;
   if (!process.env.BIGBRAIN_VAULT) return null; // 기본 경로의 첫 실행 — 정상

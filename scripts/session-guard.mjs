@@ -328,9 +328,21 @@ if (mode === "start") {
   // 출처(볼트 경로·건수)를 함께 밝힌다 — 서버가 다른 볼트를 보고 있으면
   // "인덱스엔 기억이 있는데 서버는 EMPTY" 라는 모순이 눈에 보여야 한다.
   // 밝히지 않으면 모델은 인덱스만 보고 "메모리가 잘 돌고 있다" 고 오판한다.
+  // 검증 지시를 반드시 함께 내보낸다.
+  //
+  // 이 블록은 대화 컨텍스트에 **사실처럼** 들어가고 확신도까지 달려 있어서, 모델이
+  // 코드를 확인하지 않고 그대로 단정하는 프라이밍 사고가 관측됐다(사용자가 친 문자열이
+  // 기억의 템플릿에 우연히 맞자, 저장소를 열어보기 전에 "이 프로젝트는 X 로 되어 있으므로"
+  // 라고 답한 뒤 그 다음에 grep 을 시작했다). 네이티브 메모리는 기억 파일을 읽을 때마다
+  // "N일 전 관측이다 — 현재 코드와 대조하라" 를 자동으로 붙여 이 위험을 막는다.
+  // 주입은 회상을 **대체하는 것이 아니라 시작점**이라는 점을 같은 블록 안에서 말한다.
   process.stdout.write(
     `<bigbrainmemory-index ${attrs}>\n${body}\n</bigbrainmemory-index>\n` +
       toolLines +
+      `These lines are point-in-time observations, not live state, and each carries its age. ` +
+      `Treat them as a starting point for retrieval — not as verified fact: before asserting anything from ` +
+      `this index about code, paths, versions or config, read the current source, and \`revise\` the memory if reality moved on. ` +
+      `Use recall for full text; a one-line summary is not the memory.\n` +
       `(This index was injected by a SessionStart hook reading the vault above. ` +
       `If the bigbrainmemory server reports a different vault or says the vault is EMPTY, ` +
       `the two are pointing at different paths — trust the server's tools, and tell the user about the mismatch.)\n`,

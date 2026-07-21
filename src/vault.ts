@@ -60,6 +60,45 @@ function writeFileAtomic(fp: string, text: string): void {
 }
 
 /**
+ * 이 디렉터리가 **Claude Code 네이티브 메모리 저장소**인지 판별한다.
+ *
+ * 왜 필요한가 — "네이티브 메모리를 BBM 으로 대체한다" 는 목표에서 사용자가 가장
+ * 자연스럽게 취하는 행동이 `BIGBRAIN_VAULT` 를 네이티브 memory 디렉터리로 지정하는
+ * 것이다. 그런데 그 경로는 **파괴적**이었다(실측 재현):
+ *   1. 네이티브는 평면 구조(`<memory>/*.md`)라 BBM 은 기억을 0건으로 본다
+ *   2. `regenerateIndex()` 가 `MEMORY.md` 를 자기 형식으로 **덮어쓴다** —
+ *      하필 그 파일이 네이티브가 매 세션 자동 주입하는 인덱스 본체다
+ *   3. 경고는 "경로 오타/드라이브 이동 의심" 이라 **오진**이다 (경로는 정확하다)
+ *   4. 1회차에 `.bigbrain-vault` 마커가 박히므로 **2회차부터 경고가 사라진다**
+ * 이 저장소의 개발 머신에서도 실제로 당했다(2026-07-20, 자동 메모리 인덱스 소실).
+ *
+ * 판별은 이름이 아니라 **내용**으로 한다: 네이티브 노트는 frontmatter 에
+ * `node_type: memory` 와 `originSessionId` 를 갖는다(실측 코퍼스 23/23건).
+ * BBM 볼트는 루트에 `.md` 를 MEMORY.md 하나만 두므로 오탐이 구조적으로 없다.
+ * 마커 유무를 보지 않는 것이 핵심이다 — 마커는 1회차 사고의 결과물이라,
+ * 마커를 신뢰하면 사고가 사고를 은폐한다.
+ */
+function detectNativeMemoryFiles(root: string): string[] {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(root).filter((f) => f.endsWith(".md") && f !== "MEMORY.md");
+  } catch {
+    return [];
+  }
+  const found: string[] = [];
+  for (const f of entries) {
+    try {
+      // 전체 파싱은 낭비다 — frontmatter 머리만 본다
+      const head = fs.readFileSync(path.join(root, f), "utf-8").slice(0, 600);
+      if (/^---/.test(head) && /^\s*(node_type:\s*memory|originSessionId:)/m.test(head)) found.push(f);
+    } catch {
+      /* 읽기 실패는 판정 대상 아님 */
+    }
+  }
+  return found.sort();
+}
+
+/**
  * 마크다운 볼트(Obsidian 호환)에 대한 저수준 파일 입출력.
  * vault/
  *   memories/  — 활성 기억 (*.md)
@@ -72,12 +111,20 @@ export class Vault {
   readonly archiveDir: string;
   /** 손상 파일 격리소 — 삭제하지 않고 여기로 옮긴다(원본 바이트 보존) */
   readonly quarantineDir: string;
+  /**
+   * 루트에서 발견된 Claude Code 네이티브 메모리 노트 파일명. 비어 있지 않으면
+   * **이 디렉터리는 남의 저장소다** — 인덱스와 마커를 절대 건드리지 않는다.
+   * 기동 시 한 번만 판정한다(그 뒤 우리가 만든 파일에 반응하면 안 된다).
+   */
+  readonly nativeMemoryFiles: string[];
 
   constructor(root: string) {
     this.root = root;
     this.memoriesDir = path.join(root, "memories");
     this.archiveDir = path.join(root, "archive");
     this.quarantineDir = path.join(root, "quarantine");
+    // mkdir 보다 **먼저** 판정한다 — 디렉터리를 만들고 나면 판정 근거가 흐려진다
+    this.nativeMemoryFiles = detectNativeMemoryFiles(root);
     fs.mkdirSync(this.memoriesDir, { recursive: true });
     fs.mkdirSync(this.archiveDir, { recursive: true });
   }
@@ -299,6 +346,10 @@ export class Vault {
    * 서버 기동 시마다 호출되므로 MCP 클라이언트를 켜기만 해도 diff 가 생겼다.
    */
   writeIndex(markdown: string): void {
+    // 네이티브 메모리 디렉터리를 볼트로 지정한 경우 — 인덱스도 마커도 건드리지 않는다.
+    // 여기서 쓰면 네이티브가 **매 세션 자동 주입하는 인덱스 본체**가 파괴된다.
+    // 조용히 건너뛰는 게 아니라, index.ts 가 이 상태를 경고로 크게 알린다.
+    if (this.nativeMemoryFiles.length > 0) return;
     const fp = path.join(this.root, "MEMORY.md");
     try {
       if (fs.existsSync(fp) && fs.readFileSync(fp, "utf-8") === markdown) {

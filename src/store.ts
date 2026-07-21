@@ -95,6 +95,15 @@ function today(): string {
 const HISTORY_CAP = 50;
 
 /**
+ * 이 일수 이상 갱신되지 않은 기억을 인덱스에서 "낡음" 으로 표시한다.
+ * index.ts 의 `BIGBRAIN_STALE_DAYS` 와 같은 값을 읽어 두 채널의 기준을 일치시킨다.
+ */
+const INDEX_STALE_DAYS = (() => {
+  const v = Number(process.env.BIGBRAIN_STALE_DAYS);
+  return Number.isFinite(v) && v >= 0 ? v : 30;
+})();
+
+/**
  * 이력 한 줄 추가 + 상한 유지.
  * 종전에는 상한이 없어 revise/forget/supersede 마다 약 65B 씩 무한 누적됐고
  * (재확인 110회 → 935B에서 7,426B), frontmatter 전체가 매 read 마다 재파싱된다.
@@ -819,12 +828,26 @@ export class MemoryStore {
       procedural: "방법/절차 (procedural)",
     };
     let md = "# BigBrainMemory 인덱스\n\n> 자동 생성 파일입니다. 직접 수정하지 마세요.\n";
+    // 나이를 함께 싣는다. 이 파일은 SessionStart 훅이 통째로 컨텍스트에 주입하는
+    // **주 채널**인데, 종전에는 확신도만 있고 나이가 없었다. recall 응답에는
+    // age_days/stale_hint 가 붙는데 주입 채널에만 빠져 있던 비대칭이다.
+    // 그 결과 낡은 단정문이 확신도 0.99 라는 권위만 달고 들어와, 모델이 코드를
+    // 확인하지 않고 인용하는 프라이밍 사고가 실제로 관측됐다. 네이티브 메모리가
+    // 파일을 읽을 때 "N일 전 기억 — 현재 코드와 대조하라" 를 자동으로 붙이는 것과
+    // 같은 역할을 여기서 한다.
+    const now = Date.now();
     for (const type of Object.keys(groups) as MemoryType[]) {
       const items = groups[type];
       if (items.length === 0) continue;
       md += `\n## ${label[type]}\n\n`;
       for (const m of items.sort((a, b) => b.confidence - a.confidence)) {
-        md += `- [[memories/${m.slug}|${m.title}]] — ${m.description} (확신도 ${m.confidence.toFixed(2)})\n`;
+        const ageDays = Math.max(0, Math.floor((now - Date.parse(m.updated)) / 86_400_000));
+        const age = Number.isFinite(ageDays)
+          ? ageDays >= INDEX_STALE_DAYS
+            ? ` · ${ageDays}일 전, 대조 필요`
+            : ` · ${ageDays}일 전`
+          : "";
+        md += `- [[memories/${m.slug}|${m.title}]] — ${m.description} (확신도 ${m.confidence.toFixed(2)}${age})\n`;
       }
     }
     this.vault.writeIndex(md);
