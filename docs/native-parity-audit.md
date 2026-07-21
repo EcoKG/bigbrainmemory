@@ -33,9 +33,9 @@
 |---|---|---|---|
 | N1 | 네이티브 memory 디렉터리를 볼트로 지정하면 **인덱스를 파괴하고 2회차부터 침묵**한다 | **critical** | ✅ FIXED |
 | N2 | 주 채널(훅 주입)에 나이·검증 지시가 없다 — recall 응답에만 있는 비대칭 | high | ✅ FIXED |
-| N3 | 이관 시 사람이 읽는 제목이 슬러그로 퇴화한다 | medium | OPEN (T27) |
-| N4 | 이관된 `project` 스코프가 경로 슬러그 그대로다 | medium | OPEN (T28) |
-| N5 | 대체의 주 채널이 Claude Code 전용이다 | medium | 한계로 수용 (T29) |
+| N3 | 이관 시 사람이 읽는 제목이 슬러그로 퇴화한다 | medium | ✅ FIXED |
+| N4 | 이관된 `project` 스코프가 경로 슬러그 그대로다 | medium | ✅ FIXED |
+| N5 | 대체의 주 채널이 Claude Code 전용이다 | medium | 한계로 수용 (T30) |
 
 #### N1. 네이티브 디렉터리 오지정이 파괴적이고 자기침묵한다 ★critical — FIXED
 
@@ -97,7 +97,7 @@
 > 240자를 나이에 쓰면 행동수칙이나 인덱스 건수를 깎아야 한다. 그 채널의 나이 해석 지침은
 > 이미 도구 description 에 있고(예산 밖), recall 응답이 `age_days` 를 직접 준다.
 
-#### N3. 이관 시 사람이 읽는 제목이 슬러그로 퇴화한다 — medium, OPEN
+#### N3. 이관 시 사람이 읽는 제목이 슬러그로 퇴화한다 — medium, FIXED
 
 실측(네이티브 23건 미리보기): 제목이 `toast-notify-deliverable` 로 들어간다.
 사람이 읽는 제목 `ToastNotify deliverable` 은 네이티브 **MEMORY.md 인덱스에만** 있고
@@ -109,20 +109,36 @@
 보존" 을 명시적으로 선택했다. BBM 은 slug 를 title 에서 파생하므로, 제목을 사람이 읽는
 형태로 바꾸면 slug 가 바뀌고 노트 간 위키링크가 전부 깨진다.
 
-**제안**: 2패스 이관 — 1패스에서 `name → 최종 slug` 매핑을 만들고, 2패스에서 본문의
-`[[name]]` 을 새 slug 로 치환한 뒤 저장. 네이티브 MEMORY.md 를 파싱해
-`- [제목](파일.md)` 에서 제목을 복원한다. 검증은 이번에 추가된 깨진 링크 탐지로 한다
-(이관 후 `reflect` 의 `broken_links` 가 0이어야 한다).
+**수정**: 인덱스의 `- [제목](파일.md)` 을 파싱해 제목을 복원하고(없으면 `fm.name` 폴백),
+링크는 **예측이 아니라 실제 확정된 slug** 로 치환한다 — 전부 저장한 뒤 후처리 패스에서
+`[[원본name]]` → `[[실제slug]]` 로 revise(사유 기록). 동명 충돌로 `-2` 가 붙어도 정확하고,
+앞 노트가 뒤 노트를 가리키는 경우도 처리된다. 이관 직후 `reflect().danglingLinks` 를
+스스로 확인해 결과를 출력한다. 회귀 `regress-import.mjs` 8절.
 
-#### N4. 이관된 project 스코프가 경로 슬러그 그대로다 — medium, OPEN
+실측(실제 코퍼스 23건): `ToastNotify deliverable`, `SQLite 비ASCII 경로 크래시`,
+`log.error 는 exitCode=1 설정` 등 전건 복원.
+
+#### N4. 이관된 project 스코프가 경로 슬러그 그대로다 — medium, FIXED
 
 실측: `project=C--Users-ruinp-OneDrive-------Discord-CLI-bot`.
 `BIGBRAIN_PROJECT` 를 **이 뭉개진 문자열과 정확히 같게** 설정해야만 스코프가 맞는다.
 사람이 손으로 쓸 수 있는 값이 아니고, 프로젝트를 옮기면 조용히 어긋난다.
 
-**제안**: 경로 슬러그의 마지막 의미 구간을 프로젝트명으로 정규화(`Discord-CLI-bot`)하고,
-`--project-map <원본>=<이름>` 으로 사용자가 덮어쓸 수 있게 한다. 원본 슬러그는 `source`
-필드에 이미 보존되므로 추적성은 잃지 않는다.
+**문자열 정규화로는 풀리지 않는다.** 슬러그는 실제 경로에서 영숫자가 아닌 문자를 전부
+`-` 로 바꾼 것이라(`D:\BigBrainMemory` → `D--BigBrainMemory`) 하이픈이 경로 구분자이자
+이름 문자를 겸한다. `E--Project-Go-reversproxy` 가 `Project-Go-reversproxy` 인지
+`reversproxy` 인지 알 방법이 없고, 한글 디렉터리는 `-------` 로 뭉개져 정보가 아예 없다.
+처음 세웠던 "마지막 의미 구간" 휴리스틱은 이 때문에 폐기했다.
+
+**수정 — 역매핑**: `~/.claude.json` 의 `projects` 키가 실제 절대경로이므로, 같은 규칙으로
+뭉갠 값이 슬러그와 일치하는 경로를 찾아 basename 을 쓴다. 추정이 아니라 정확 복원이다.
+`--project-map <슬러그>=<이름>` 으로 덮어쓸 수 있고, 실패하면 슬러그를 유지하며 이유를
+출력한다(조용한 손실 금지). 회귀 `regress-import.mjs` 9절.
+
+실측(이 머신 10개 프로젝트): **9개 정확 복원**, 공백·한글 이름까지 살아남았다 —
+`공유폴더 에브리띵`, `Discord CLI bot`, `design_handoff_mfc_toast`. 여러 경로가 걸리는
+경우는 `D:\x` 와 `D:/x` 처럼 표기만 다른 같은 디렉터리라 basename 이 하나로 모인다(10/10).
+나머지 1개는 설정에 항목이 없어 슬러그를 유지했다.
 
 #### N5. 대체의 주 채널이 Claude Code 전용이다 — medium, 한계로 수용
 

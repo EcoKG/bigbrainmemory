@@ -355,6 +355,11 @@ npm run import:native                 # 미리보기 — 아무것도 쓰지 않
 npm run import:native -- --apply      # 실제 이관 (동일 source 는 건너뜀, 멱등)
 ```
 
+이관 시 두 가지를 복원합니다.
+
+- **사람이 읽는 제목** — 노트의 `name:` 필드는 슬러그(`toast-notify-deliverable`)이고 진짜 제목(`ToastNotify deliverable`)은 네이티브 `MEMORY.md` 인덱스에만 있습니다. 인덱스를 파싱해 되살립니다. 제목이 바뀌면 슬러그도 바뀌므로, 노트끼리 걸어둔 `[[위키링크]]`를 **실제 확정된 슬러그**로 치환하는 후처리가 함께 돕니다(이관 직후 깨진 링크 수를 스스로 보고합니다).
+- **프로젝트명** — `project=C--Users-ruinp-OneDrive-------Discord-CLI-bot` 같은 뭉개진 경로 슬러그 대신 실제 디렉터리명(`Discord CLI bot`)을 씁니다. `~/.claude.json`의 실제 경로와 대조하는 역매핑이라 추정이 아닙니다. 실패하면 슬러그를 유지하고 이유를 출력하며, `--project-map <슬러그>=<이름>`으로 직접 지정할 수 있습니다.
+
 이관 후에도 네이티브 노트 원본은 그대로 남습니다. `BIGBRAIN_VAULT`는 **별도 디렉터리**를 가리키게 두세요.
 
 ## 동시 사용 안전성
