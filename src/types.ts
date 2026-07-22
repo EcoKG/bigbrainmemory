@@ -77,6 +77,12 @@ export interface RememberInput {
   supersedes?: string;
   /** 이 기억이 추상화한 근거 에피소드들의 slug (T35 공고화) */
   derivedFrom?: string[];
+  /**
+   * 파일명·위키링크 대상으로 쓸 슬러그. 생략하면 제목에서 파생된다.
+   * 제목과 분리한 이유: 종전에는 링크 대상을 안정적으로 두려면 제목 자체를 영문 케밥으로
+   * 강제해야 했다 — 파일명 규칙과 사람이 읽는 이름은 별개의 요구다.
+   */
+  slug?: string;
 }
 
 export interface ReviseInput {

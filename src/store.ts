@@ -95,6 +95,29 @@ function today(): string {
 const HISTORY_CAP = 50;
 
 /**
+ * 본문에서 위키링크 대상을 뽑는다 — **코드는 제외한다.**
+ *
+ * 종전에는 본문 전체에 정규식을 걸어, 코드 블록이나 백틱 안에 **예시로 적은** 표기를
+ * 실제 링크로 인식했다. 실사용에서 즉시 터졌다: 링크 표기법을 설명하는 메모리를 저장하자
+ * 그 설명문 자체가 깨진 링크로 보고됐고, 문서 성격의 기억은 상시 broken 으로 잡혔다.
+ *
+ * 오탐은 침묵보다 나쁘다 — 매번 "깨졌다" 고 하는 검증기는 곧 무시당하고, 그러면 진짜
+ * 깨진 링크도 함께 묻힌다. 코드 펜스와 인라인 코드 스팬을 먼저 지우고 찾는다.
+ */
+export function bodyWikilinks(body: string): string[] {
+  const prose = body
+    .replace(/```[\s\S]*?```/g, " ") // 펜스 코드 블록
+    .replace(/~~~[\s\S]*?~~~/g, " ")
+    .replace(/`[^`\n]*`/g, " "); // 인라인 코드 스팬
+  const out: string[] = [];
+  for (const mt of prose.matchAll(/\[\[([^\]|#]+)/g)) {
+    const t = mt[1].trim().replace(/^memories\//, "");
+    if (t !== "") out.push(t);
+  }
+  return out;
+}
+
+/**
  * 이 일수 이상 갱신되지 않은 기억을 인덱스에서 "낡음" 으로 표시한다.
  * index.ts 의 `BIGBRAIN_STALE_DAYS` 와 같은 값을 읽어 두 채널의 기준을 일치시킨다.
  */
@@ -424,7 +447,10 @@ export class MemoryStore {
 
   remember(input: RememberInput): { record: MemoryRecord; similar: MemoryRecord[]; dangling: string[] } {
     const now = nowIso();
-    const slug = this.vault.makeSlug(input.title);
+    // 슬러그를 제목과 분리한다. 종전에는 제목에서만 파생돼, 위키링크 대상을 안정적으로
+    // 유지하려면 **제목 자체를 영문 케밥으로 강제**해야 했다(실사용에서 이관 시 한국어
+    // 제목을 통째로 포기했다). 파일명 규칙과 사람이 읽는 이름은 별개의 요구다.
+    const slug = this.vault.makeSlug(input.slug?.trim() || input.title);
     const record: MemoryRecord = {
       id: newId(),
       slug,
@@ -486,9 +512,32 @@ export class MemoryStore {
       this.link(finalSlug, target);
     }
 
+    // 본문에 쓴 `[[위키링크]]` 도 연상망에 반영한다.
+    //
+    // 종전에는 `links` 인자로 넘긴 것만 연결됐고 본문 링크는 무시됐다. 그래서 Obsidian
+    // 에서는 연결로 보이는데 recall 의 확산에는 안 잡히는 상태가 됐다 — 실사용에서
+    // 이관한 27건이 전부 orphan 으로 남았다. 깨진 링크 검증은 이미 본문을 읽고 있었으니
+    // 한쪽 눈만 뜨고 있던 셈이다.
+    //
+    // **단방향으로만 붙인다.** link() 는 양방향이라 대상 파일까지 고쳐 쓰는데, 기억 하나를
+    // 저장했더니 남의 파일이 바뀌는 것은 놀라움의 원칙에 어긋난다(Obsidian 도 대상 파일을
+    // 고치지 않는다). 확산은 링크를 가진 쪽에서 나가므로 orphan 문제는 이것으로 해소된다.
+    // 양방향이 필요하면 `link` 를 명시적으로 부르면 된다.
+    const stored = this.vault.read(finalSlug);
+    if (stored) {
+      const known = new Set(this.vault.listSlugs(true).map((s) => s.slug));
+      const fromBody = bodyWikilinks(stored.body).filter(
+        (t) => t !== finalSlug && known.has(t) && !stored.links.includes(t),
+      );
+      if (fromBody.length > 0) {
+        stored.links.push(...fromBody);
+        this.vault.write(stored);
+      }
+    }
+
     this.regenerateIndex();
-    const stored = this.vault.read(finalSlug) ?? record;
-    return { record: stored, similar, dangling: this.danglingLinks(stored) };
+    const final = this.vault.read(finalSlug) ?? record;
+    return { record: final, similar, dangling: this.danglingLinks(final) };
   }
 
   /**
@@ -1001,7 +1050,7 @@ export class MemoryStore {
       return []; // 볼트를 못 읽으면 판정하지 않는다 — 오탐이 침묵보다 나쁘다
     }
     const targets = new Set<string>(m.links);
-    for (const mt of m.body.matchAll(/\[\[([^\]|#]+)/g)) targets.add(mt[1].trim());
+    for (const t of bodyWikilinks(m.body)) targets.add(t);
     return [...targets]
       // 인덱스(MEMORY.md)가 쓰는 `memories/<slug>` 표기도 같은 대상으로 본다
       .map((t) => t.replace(/^memories\//, ""))

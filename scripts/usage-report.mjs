@@ -97,6 +97,20 @@ const report = {
     // ★ A/B 1차 지표 후보 (단, 천장효과 주의 — 파일 머리 참고)
     storedAtLeastOne: storedSessions.length,
     storeRate: pct(storedSessions.length, workSessions.length),
+    // ★ 이진 저장률만 보면 **긴 세션의 실패가 성공으로 보인다.**
+    // 실사용 사례: 3시간 세션에서 초반에 사소한 것 1건을 저장한 뒤 2시간 동안 결함 3건을
+    // 확정하고 근본 원인을 규명했는데 그 구간이 통째로 새어나갔다 — 그런데 이 세션은
+    // "저장 있음" 으로 집계돼 지표상 성공이었다. 저장 건수와 턴당 밀도를 함께 봐야
+    // 그런 세션이 드러난다.
+    storesTotal: workSessions.reduce((s, e) => s + (e.stored ?? 0), 0),
+    storesPerSessionMedian: (() => {
+      if (workSessions.length === 0) return null;
+      const xs = workSessions.map((e) => e.stored ?? 0).sort((a, b) => a - b);
+      const mid = Math.floor(xs.length / 2);
+      return xs.length % 2 ? xs[mid] : (xs[mid - 1] + xs[mid]) / 2;
+    })(),
+    /** 도구를 많이 쓴 긴 세션인데 저장이 1건 이하인 경우 — 가장 새기 쉬운 구간 */
+    longSessionsWithThinStorage: workSessions.filter((e) => (e.toolUses ?? 0) >= 30 && (e.stored ?? 0) <= 1).length,
     // Stop 훅 넛지가 실제로 저장을 유도했는가 (T31 이 전달 경로를 고친 뒤의 효과 측정)
     storedAfterWarning: storedAfterWarning.length,
     memoryLossEvents: lossEvents.length,
@@ -128,6 +142,10 @@ console.log("── 세션 (훅 기록)");
 console.log(`  시작 ${starts.length} · 종료 ${ends.length} · 게이트 미만(잡담) ${report.sessions.belowToolGate}`);
 console.log(`  작업 세션 ${workSessions.length} 중 저장 있음 ${storedSessions.length}  →  저장률 ${report.sessions.storeRate}`);
 if (storedAfterWarning.length > 0) console.log(`  그중 Stop 훅 경고를 받고 나서 저장한 세션 ${storedAfterWarning.length}건`);
+console.log(`  총 저장 ${report.sessions.storesTotal}건 · 세션당 중앙값 ${report.sessions.storesPerSessionMedian ?? "n/a"}`);
+if (report.sessions.longSessionsWithThinStorage > 0) {
+  console.log(`  ⚠ 도구 30회 이상 쓰고 저장 1건 이하인 세션 ${report.sessions.longSessionsWithThinStorage}건 — 이진 저장률로는 성공으로 보이는 구간입니다`);
+}
 if (lossEvents.length > 0) console.log(`  ⚠ 볼트 손실 감지 ${lossEvents.length}회 — 총 ${lossEvents.reduce((s, e) => s + e.lost, 0)}건 소실`);
 console.log("");
 console.log("── 도구 호출");

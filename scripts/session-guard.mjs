@@ -267,10 +267,15 @@ function readMarker() {
         logged: o.logged === true,
         /** 저장 결과를 남겼는가 — 무저장 기록과 별개다(경고 뒤 저장한 세션을 잡기 위해) */
         loggedStored: o.loggedStored === true,
-        /** 이 세션에서 부호화 큐를 이미 냈는가 (T34, 세션당 1회) */
+        /** 이 세션에서 부호화 큐를 낸 적이 있는가 (진단용) */
         cued: o.cued === true,
         /** 지금까지의 사용자 턴 수 — prompt 를 못 받는 환경의 폴백 기준 */
         turns: Number.isFinite(o.turns) ? o.turns : 0,
+        /** 마지막 큐를 낸 턴 — 쿨다운 기준 (세션당 1회가 아니다) */
+        lastCueTurn: Number.isFinite(o.lastCueTurn) ? o.lastCueTurn : Number.NaN,
+        /** 마지막 저장 시점의 기억 수·턴 — 큐 판정의 기준선. 저장할 때마다 리셋된다 */
+        cueBaseCount: Number.isFinite(o.cueBaseCount) ? o.cueBaseCount : Number.NaN,
+        cueBaseTurn: Number.isFinite(o.cueBaseTurn) ? o.cueBaseTurn : Number.NaN,
       };
     }
   } catch {
@@ -333,12 +338,36 @@ if (mode === "prompt") {
   // 기준선이 없으면(세션 시작을 못 봤으면) 판단 근거가 없다
   if (!m || !Number.isFinite(m.count)) process.exit(0);
   if (hookInput.sessionId && m.sessionId && hookInput.sessionId !== m.sessionId) process.exit(0);
-  // 이미 저장한 세션에는 말을 걸지 않는다 — 부호화는 이미 일어났다
-  if (countMemories() > m.count) process.exit(0);
-  // 세션당 한 번. 매 턴 떠들면 경보 피로로 정작 볼 신호가 묻힌다(Stop 훅에서 배운 것).
-  if (m.cued) process.exit(0);
-
   const turns = Number.isFinite(m.turns) ? m.turns + 1 : 1;
+
+  // **이진 판정이 아니라 증분 판정이다.**
+  //
+  // 처음 구현은 "이 세션에서 한 건이라도 저장했으면 영구 침묵" 이었다. 실사용에서 바로
+  // 터졌다 — 3시간짜리 세션에서 초반에 사소한 것 하나를 저장하자 그 뒤 2시간 동안 결함
+  // 3건을 확정하고 근본 원인을 규명하는 동안 신호가 한 번도 나가지 않았다. 세션 최대
+  // 성과가 통째로 새어나갔는데 **저장률 지표상으로는 성공한 세션**이었다.
+  // 지표가 실패를 못 보는 것이 결함 자체보다 나쁘다.
+  //
+  // 그래서 기준선을 세션 시작에 고정하지 않고 **저장이 일어날 때마다 리셋**한다.
+  // 침묵은 영구가 아니라 재출발이다.
+  const base = Number.isFinite(m.cueBaseCount) ? m.cueBaseCount : m.count;
+  const baseTurn = Number.isFinite(m.cueBaseTurn) ? m.cueBaseTurn : 0;
+  const current = countMemories();
+  if (current > base) {
+    // 저장이 있었다 — 시계를 여기서 다시 시작하고 이번 턴은 조용히 지나간다
+    writeMarker({ ...m, turns, cueBaseCount: current, cueBaseTurn: turns });
+    process.exit(0);
+  }
+
+  // 쿨다운 — 세션당 1회는 과했지만 매 턴도 안 된다(경보 피로). 그 사이를 잡는다.
+  const COOLDOWN = (() => {
+    const v = Number(process.env.BIGBRAIN_CUE_COOLDOWN);
+    return Number.isFinite(v) && v > 0 ? v : 15;
+  })();
+  if (Number.isFinite(m.lastCueTurn) && turns - m.lastCueTurn < COOLDOWN) {
+    writeMarker({ ...m, turns });
+    process.exit(0);
+  }
 
   // 정정·놀라움의 어휘 신호. 사용자가 "아니라" 고 말하는 순간이 부호화 계기다.
   // prompt 가 안 오는 환경에서는 이 경로가 통째로 비활성화되고 아래 턴 기반으로 퇴화한다.
@@ -349,16 +378,20 @@ if (mode === "prompt") {
     const v = Number(process.env.BIGBRAIN_CUE_TURNS);
     return Number.isFinite(v) && v > 0 ? v : 8;
   })();
-  const turnHit = turns >= TURN_CUE;
+  // 세션 시작이 아니라 **마지막 저장 이후** 몇 턴이 지났는지를 본다
+  const turnHit = turns - baseTurn >= TURN_CUE;
 
-  writeMarker({ ...m, turns, cued: lexicalHit || turnHit });
-  if (!lexicalHit && !turnHit) process.exit(0);
+  if (!lexicalHit && !turnHit) {
+    writeMarker({ ...m, turns });
+    process.exit(0);
+  }
+  writeMarker({ ...m, turns, lastCueTurn: turns, cued: true });
 
   const tool = (n) => `mcp__${resolveServerName()}__${n}`;
   const why = lexicalHit
     ? `The user's message matched a correction-like phrasing. **This is a regex guess, not an observation** — ` +
       `verify against what the user actually wrote before treating it as a correction.`
-    : `${turns} turns into this session with nothing stored yet.`;
+    : `${turns - baseTurn} turns since anything was last stored${baseTurn > 0 ? " (a memory was stored earlier in this session — this is about what has happened since)" : ""}.`;
 
   process.stdout.write(
     `<bigbrainmemory-cue kind="lexical-hint">\n` +

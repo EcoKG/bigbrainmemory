@@ -430,6 +430,12 @@ server.registerTool(
           "Project this memory belongs to. OMIT for knowledge that applies everywhere (user preferences, general workflows) — those stay globally recallable. Set it for project-specific facts so other projects are not polluted.",
         ),
       supersedes: z.string().optional().describe("Slug or id of an outdated memory this one replaces"),
+      slug: z
+        .string()
+        .optional()
+        .describe(
+          "Filename / wikilink target. Defaults to a slug derived from `title`. Set it when you want a stable ASCII link target while keeping a human-readable title in another language — do not distort the title just to control the filename.",
+        ),
       derived_from: z
         .array(z.string())
         .optional()

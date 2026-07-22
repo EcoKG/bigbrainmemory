@@ -105,18 +105,61 @@ console.log("3) prompt 부재 시 턴 기반 폴백");
   }
   check("임계 전에는 침묵", outs[0] === "" && outs[1] === "", outs.map((o) => o.length).join(","));
   check("임계 턴에 큐 발생", outs[2] !== "", outs[2].slice(0, 200));
-  check("턴 근거를 밝힘", /3 turns into this session/.test(outs[2]), outs[2].slice(0, 200));
+  // 기준은 "세션 시작 이후" 가 아니라 "마지막 저장 이후" 다 — 긴 세션에서 그 차이가 전부다
+  check("턴 근거를 밝힘", /3 turns since anything was last stored/.test(outs[2]), outs[2].slice(0, 200));
   check("턴 수가 마커에 누적됨", marker(v).turns === 3, JSON.stringify(marker(v)));
 }
 
-// ── 4. 이미 저장한 세션에는 말을 걸지 않는다
-console.log("4) 저장한 세션에는 침묵");
+// ── 4. 저장은 큐를 **영구히** 끄지 않는다 — 시계를 리셋할 뿐이다
+//
+// ★ 이 절이 실사용에서 터진 결함을 고정한다.
+// 처음 구현은 "이 세션에서 한 건이라도 저장했으면 영구 침묵" 이었다. 3시간짜리 세션에서
+// 초반에 사소한 것 하나를 저장하자, 그 뒤 2시간 동안 결함 3건을 확정하고 근본 원인을
+// 규명하는 내내 신호가 한 번도 나가지 않았다. 세션 최대 성과가 통째로 새어나갔는데
+// **저장률 지표상으로는 성공한 세션**이었다.
+console.log("4) 저장은 큐를 영구히 끄지 않는다");
 {
-  const v = freshVault("stored");
+  const v = freshVault("reset");
   run(["--start", "--vault-force", v], v, startEv({ session_id: "C5", source: "startup" }));
-  fs.writeFileSync(path.join(v, "memories", "새기억.md"), "x", "utf-8"); // 부호화가 이미 일어났다
-  const out = run(["--prompt", "--vault-force", v], v, promptEv({ session_id: "C5", prompt: "아니야 틀렸어" }));
-  check("이미 저장했으면 침묵", out.trim() === "", out.slice(0, 200));
+
+  // 저장 직후에는 조용하다 — 부호화가 방금 일어났으니 맞다
+  fs.writeFileSync(path.join(v, "memories", "새기억.md"), "x", "utf-8");
+  const right = run(["--prompt", "--vault-force", v], v, promptEv({ session_id: "C5", prompt: "아니야 틀렸어" }));
+  check("저장 직후에는 침묵", right.trim() === "", right.slice(0, 200));
+
+  // ★ 패치 전 실패: 여기서부터 영원히 침묵했다. 이제는 시계가 다시 흐른다.
+  const outs = [];
+  for (let i = 0; i < 6; i++) {
+    outs.push(run(["--prompt", "--vault-force", v], v, promptEv({ session_id: "C5" }), { BIGBRAIN_CUE_TURNS: "4" }).trim());
+  }
+  check("저장 이후에도 시간이 지나면 다시 큐", outs.some((o) => o !== ""), `발화 ${outs.filter((o) => o).length}회`);
+  const cue = outs.find((o) => o !== "");
+  check("마지막 저장 기준으로 센다", /turns since anything was last stored/.test(cue ?? ""), (cue ?? "").slice(0, 200));
+  check("세션 중 저장이 있었음을 밝힘", /a memory was stored earlier in this session/.test(cue ?? ""), (cue ?? "").slice(0, 300));
+
+  // 다시 저장하면 또 리셋된다
+  fs.writeFileSync(path.join(v, "memories", "두번째.md"), "x", "utf-8");
+  const afterSecond = run(["--prompt", "--vault-force", v], v, promptEv({ session_id: "C5" }), { BIGBRAIN_CUE_TURNS: "4" });
+  check("두 번째 저장도 시계를 리셋", afterSecond.trim() === "", afterSecond.slice(0, 200));
+}
+
+// ── 4-b. 쿨다운 — 세션당 1회는 과하고 매 턴은 시끄럽다
+console.log("4-b) 쿨다운");
+{
+  const v = freshVault("cool");
+  run(["--start", "--vault-force", v], v, startEv({ session_id: "C5b", source: "startup" }));
+  const outs = [];
+  for (let i = 0; i < 12; i++) {
+    outs.push(
+      run(["--prompt", "--vault-force", v], v, promptEv({ session_id: "C5b", prompt: "아니야 틀렸어" }), {
+        BIGBRAIN_CUE_COOLDOWN: "5",
+      }).trim(),
+    );
+  }
+  const fired = outs.map((o, i) => (o !== "" ? i : -1)).filter((i) => i >= 0);
+  check("12턴 연속 정정에도 매번 울리지는 않음", fired.length < 12, `발화 ${fired.length}회`);
+  check("세션당 1회보다는 자주 울림", fired.length >= 2, `발화 ${fired.length}회 (${fired.join(",")})`);
+  check("발화 간격이 쿨다운 이상", fired.every((t, i) => i === 0 || t - fired[i - 1] >= 5), fired.join(","));
 }
 
 // ── 5. 자동 저장 경로를 만들지 않는다 (P6 의 대칭)
