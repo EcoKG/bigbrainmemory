@@ -430,17 +430,25 @@ server.registerTool(
           "Project this memory belongs to. OMIT for knowledge that applies everywhere (user preferences, general workflows) — those stay globally recallable. Set it for project-specific facts so other projects are not polluted.",
         ),
       supersedes: z.string().optional().describe("Slug or id of an outdated memory this one replaces"),
+      derived_from: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Slugs of the episodic memories this one abstracts (consolidation). Use when you notice the same thing happened several times and are recording the general rule. " +
+            "The source episodes are NEVER modified or deleted — they stay verbatim and keep surfacing in recall. This field only records where the generalisation came from, so it can be audited and revisited.",
+        ),
     },
   },
   async (args) => {
     // project 를 생략하면 전역 기억이다 — 서버 스코프를 몰래 씌우지 않는다.
     // (씌우면 "전역이면 생략" 이라는 도구 설명과 모순되고, 사용자 선호 같은
     //  범용 지식이 한 프로젝트에 갇혀 다른 곳에서 조용히 회상되지 않는다)
-    const { record, similar, dangling } = store.remember(args);
+    const { record, similar, dangling } = store.remember({ ...args, derivedFrom: args.derived_from });
     logUsage({
       tool: "remember",
       ok: true,
       type: args.type,
+      derivedCount: record.derivedFrom?.length ?? 0,
       scoped: args.project !== undefined,
       similarCount: similar.length,
       danglingCount: dangling.length,
@@ -565,16 +573,20 @@ server.registerTool(
         .string()
         .optional()
         .describe("Reassign project scope. Pass an empty string to make the memory global again."),
+      type: MEMORY_TYPE.optional().describe(
+        "Reclassify the memory type. Use to fix a misclassification, or when a repeated experience has become general knowledge (episodic → semantic). The change is recorded in history.",
+      ),
     },
   },
-  async ({ id, reason, content, title, description, tags, confidence, source, project }) => {
-    const m = store.revise(id, { reason, content, title, description, tags, confidence, source, project });
+  async ({ id, reason, content, title, description, tags, confidence, source, project, type }) => {
+    const m = store.revise(id, { reason, content, title, description, tags, confidence, source, project, type });
     // revise 호출률은 자기교정 루프가 도는지의 지표다 — 낡은 기억이 방치되는지 여기서 드러난다
     logUsage({
       tool: "revise",
       ok: m !== null,
       contentChanged: content !== undefined,
       confidenceChanged: confidence !== undefined,
+      typeChanged: type !== undefined,
     });
     if (!m) return fail(`Memory not found: ${id}`);
     return ok({ revised: full(m) });
@@ -651,10 +663,16 @@ server.registerTool(
       possible_duplicates: r.duplicates,
       orphans_without_links: r.orphans.map((m) => m.slug),
       broken_links: r.danglingLinks,
+      // 서버는 후보만 낸다 — 어느 것이 진짜 패턴인지는 본문을 읽어야 알 수 있고 그건 모델의 일이다
+      consolidation_candidates: r.consolidationCandidates,
       suggestion:
         "Review forget_candidates and `forget` the ones that are truly obsolete/wrong (reversible — moved to archive). Revise low-confidence memories if you can confirm or correct them. Merge duplicates (revise one, forget the other). Link orphans to related memories." +
         (r.danglingLinks.length > 0
           ? " broken_links point at slugs that do not exist — either `remember` the missing memory or `revise` the body to drop the link."
+          : "") +
+        (r.consolidationCandidates.length > 0
+          ? " consolidation_candidates are episodes that keep recurring under one theme. Read them, and if a general rule genuinely holds across them, `remember` it as `semantic` with `derived_from` set to those slugs. " +
+            "Do NOT delete or rewrite the episodes — they stay verbatim as the evidence. If the episodes only look alike on the surface, leave them alone: three coincidences are not a rule."
           : ""),
     });
   },

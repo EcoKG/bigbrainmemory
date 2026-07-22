@@ -41,7 +41,7 @@ const MIN_TOOL_USES = (() => {
 const STDIN_TIMEOUT_MS = 250;
 
 const argv = process.argv.slice(2);
-const mode = argv.includes("--stop") ? "stop" : "start";
+const mode = argv.includes("--stop") ? "stop" : argv.includes("--prompt") ? "prompt" : "start";
 const argValue = (flag) => {
   const i = argv.indexOf(flag);
   return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
@@ -201,7 +201,7 @@ function countTotal() {
  * 입력이 없는 셈 치고 진행한다(그 경우 종전 동작으로 자연히 퇴화한다).
  */
 async function readHookInput() {
-  const empty = { sessionId: null, source: null, transcriptPath: null };
+  const empty = { sessionId: null, source: null, transcriptPath: null, prompt: null };
   if (process.stdin.isTTY) return empty;
   const raw = await new Promise((resolve) => {
     let buf = "";
@@ -233,6 +233,9 @@ async function readHookInput() {
       sessionId: typeof o?.session_id === "string" ? o.session_id : null,
       source: typeof o?.source === "string" ? o.source : null,
       transcriptPath: typeof o?.transcript_path === "string" ? o.transcript_path : null,
+      // UserPromptSubmit 에만 온다. **문서로 확정되지 않은 필드라, 있으면 쓰고 없으면
+      // 상태 기반으로 자연히 퇴화한다** — 미확인 계약 위에 기능을 세우지 않는다.
+      prompt: typeof o?.prompt === "string" ? o.prompt : null,
     };
   } catch {
     return empty;
@@ -264,13 +267,19 @@ function readMarker() {
         logged: o.logged === true,
         /** 저장 결과를 남겼는가 — 무저장 기록과 별개다(경고 뒤 저장한 세션을 잡기 위해) */
         loggedStored: o.loggedStored === true,
+        /** 이 세션에서 부호화 큐를 이미 냈는가 (T34, 세션당 1회) */
+        cued: o.cued === true,
+        /** 지금까지의 사용자 턴 수 — prompt 를 못 받는 환경의 폴백 기준 */
+        turns: Number.isFinite(o.turns) ? o.turns : 0,
       };
     }
   } catch {
     /* 구형 포맷 — 아래에서 숫자로 해석 */
   }
   const n = Number.parseInt(raw, 10);
-  return Number.isFinite(n) ? { sessionId: null, count: n, total: Number.NaN, warned: false, logged: false } : null;
+  return Number.isFinite(n)
+    ? { sessionId: null, count: n, total: Number.NaN, warned: false, logged: false, loggedStored: false, cued: false, turns: 0 }
+    : null;
 }
 
 /**
@@ -305,6 +314,65 @@ function writeMarker(m) {
 }
 
 const hookInput = await readHookInput();
+
+// ── prompt: 부호화 큐 (T34)
+//
+// **왜 Stop 이 아니라 여기인가.** 사람은 "이걸 기억해야지" 하고 기억하지 않는다 —
+// 놀라움·정정·완결 같은 계기가 그 자리에서 부호화를 유발한다(Craik & Lockhart 1972 의
+// 부수적 조건 파지). BBM 의 유일한 부호화 경로는 명시적 remember 호출이었고, 유일한
+// 넛지는 Stop 훅이라 **세션이 끝날 때** 나왔다. 그때는 이미 늦다: 맥락이 압축됐을 수 있고,
+// 그러면 요약에서 재구성해 저장하게 되는데 그건 P8 이 금지하는 요지 기반 재구성이다.
+// UserPromptSubmit 은 stdout 이 컨텍스트로 들어가는 확인된 세 이벤트 중 하나이고,
+// 무엇보다 **턴 시작 시점**이라 아직 원문이 살아 있다.
+//
+// **자동 저장은 만들지 않는다.** 훅은 큐만 내고 판단은 모델이 한다 — P6(자동 삭제 금지)의
+// 대칭이다. 정규식이 사용자의 의도를 아는 척하면 안 되므로, 큐는 스스로 기계 휴리스틱임을
+// 밝히고 출처·타입을 지정하지 않는다.
+if (mode === "prompt") {
+  const m = readMarker();
+  // 기준선이 없으면(세션 시작을 못 봤으면) 판단 근거가 없다
+  if (!m || !Number.isFinite(m.count)) process.exit(0);
+  if (hookInput.sessionId && m.sessionId && hookInput.sessionId !== m.sessionId) process.exit(0);
+  // 이미 저장한 세션에는 말을 걸지 않는다 — 부호화는 이미 일어났다
+  if (countMemories() > m.count) process.exit(0);
+  // 세션당 한 번. 매 턴 떠들면 경보 피로로 정작 볼 신호가 묻힌다(Stop 훅에서 배운 것).
+  if (m.cued) process.exit(0);
+
+  const turns = Number.isFinite(m.turns) ? m.turns + 1 : 1;
+
+  // 정정·놀라움의 어휘 신호. 사용자가 "아니라" 고 말하는 순간이 부호화 계기다.
+  // prompt 가 안 오는 환경에서는 이 경로가 통째로 비활성화되고 아래 턴 기반으로 퇴화한다.
+  const LEXICAL = /아니(야|라|고|다|에요|예요)|틀렸|그게 아니|잘못(됐|했)|하지 ?말|말고|대신|정정|아까 말한|not that|actually|instead|you're wrong|that's wrong|no,? use/i;
+  const lexicalHit = hookInput.prompt !== null && LEXICAL.test(hookInput.prompt);
+  // prompt 를 못 받는 환경의 폴백 — 충분히 진행됐는데 아직 저장이 0건이면 한 번 물어본다
+  const TURN_CUE = (() => {
+    const v = Number(process.env.BIGBRAIN_CUE_TURNS);
+    return Number.isFinite(v) && v > 0 ? v : 8;
+  })();
+  const turnHit = turns >= TURN_CUE;
+
+  writeMarker({ ...m, turns, cued: lexicalHit || turnHit });
+  if (!lexicalHit && !turnHit) process.exit(0);
+
+  const tool = (n) => `mcp__${resolveServerName()}__${n}`;
+  const why = lexicalHit
+    ? `The user's message matched a correction-like phrasing. **This is a regex guess, not an observation** — ` +
+      `verify against what the user actually wrote before treating it as a correction.`
+    : `${turns} turns into this session with nothing stored yet.`;
+
+  process.stdout.write(
+    `<bigbrainmemory-cue kind="lexical-hint">\n` +
+      `${why}\n` +
+      `If a REMEMBER trigger genuinely fired — the user corrected you or stated a preference, a decision settled, ` +
+      `you found a non-obvious root cause, a convention was agreed — call ${tool("remember")} **now**, while the ` +
+      `wording is still verbatim in context, rather than at the end of the session. Record provenance accurately in ` +
+      `\`source\` and pick \`type\` yourself; do not infer either from this cue. ` +
+      `If nothing durable happened, ignore this and continue — it is shown once per session.\n` +
+      `</bigbrainmemory-cue>\n`,
+  );
+  logUsage({ event: "cue", sessionId: m.sessionId, turns, reason: lexicalHit ? "lexical" : "turns" });
+  process.exit(0);
+}
 
 if (mode === "start") {
   const count = countMemories();

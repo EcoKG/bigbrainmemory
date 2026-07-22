@@ -442,6 +442,12 @@ export class MemoryStore {
       accessCount: 0,
       source: input.source,
       project: input.project,
+      // 공고화 출처 — 볼트에 실제로 있는 것만 남긴다. 없는 슬러그를 근거로 적어두면
+      // "출처가 있는 것처럼 보이는데 확인 불가" 라는 최악의 상태가 된다(P8).
+      derivedFrom: (() => {
+        const from = (input.derivedFrom ?? []).filter((s) => this.vault.find(s) !== null);
+        return from.length > 0 ? from : undefined;
+      })(),
       links: [],
       history: [`${today()}: created${input.source ? ` (source: ${input.source})` : ""}`],
       body: input.content.trim(),
@@ -579,10 +585,21 @@ export class MemoryStore {
 
     // P5: 측면억제(RIF) — 상위 결과와 유사한 하위 경쟁 기억은 순위에서만 눌린다.
     // 저장된 진실성·저장강도는 절대 건드리지 않는다(오삭제 위험 차단).
+    //
+    // **공고화 3조 ③ — 파생물은 자기 근거를 누르지 않는다 (T35).**
+    // 파생물은 정의상 근거 에피소드들과 토큰이 겹치므로 RIF 임계를 넘긴다. 그대로 두면
+    // 요약이 원본을 순위에서 밀어내고, 모델이 보는 것이 verbatim 원본 대신 요지가 된다.
+    // 저장 상태는 그대로라 P5 의 형식은 지키지만, **작동 계층에서 요지가 원본을 대체**하는
+    // 것이라 P8 의 취지를 정면으로 어긴다. 그래서 그 쌍만 예외로 둔다.
+    const suppresses = (winner: SearchResult, loser: SearchResult) =>
+      !(winner.record.derivedFrom ?? []).includes(loser.record.slug) &&
+      !(loser.record.derivedFrom ?? []).includes(winner.record.slug);
+
     const kept: SearchResult[] = [];
     for (const r of scored) {
       const rivalOf = kept.find(
         (k) =>
+          suppresses(k, r) &&
           overlap(
             tokenize(k.record.title + " " + k.record.description),
             tokenize(r.record.title + " " + r.record.description),
@@ -591,6 +608,7 @@ export class MemoryStore {
       if (rivalOf) {
         r.score *= 0.5;
         r.inhibited = true;
+        r.inhibitedBy = rivalOf.record.slug;
       }
       kept.push(r);
     }
@@ -667,6 +685,12 @@ export class MemoryStore {
     if (input.confidence !== undefined) m.confidence = Math.min(1, Math.max(0, input.confidence));
     if (input.source !== undefined) m.source = input.source;
     if (input.project !== undefined) m.project = input.project || undefined; // 빈 문자열 = 전역으로 되돌리기
+    // 유형 교정 (T35). 종전에는 생성 시 정해진 뒤 바뀔 길이 없어 오분류조차 못 고쳤고,
+    // 반복 경험이 일화에서 의미로 넘어가는 전이를 표현할 수단도 없었다.
+    // 바뀌었을 때만 이력에 남긴다 — 무엇이 왜 재분류됐는지가 감사 대상이다.
+    const typeChanged = input.type !== undefined && input.type !== m.type;
+    const oldType = m.type;
+    if (input.type !== undefined) m.type = input.type;
     this.ensureBodyLinks(m); // 본문 교체로 연상 링크가 소실되지 않도록 복원
 
     // 재공고화: 재확인/갱신은 기억을 강화하고 최근성 시계를 갱신.
@@ -683,6 +707,7 @@ export class MemoryStore {
     }
     m.lastAccessed = nowIso();
     m.updated = nowIso();
+    if (typeChanged) pushHistory(m, `${today()}: reclassified ${oldType} → ${m.type}`);
     pushHistory(
       m,
       `${today()}: ${contentChanged ? "revised" : "reconfirmed"} — ${input.reason}${input.source ? ` (source: ${input.source})` : ""}`,
@@ -734,6 +759,8 @@ export class MemoryStore {
     orphans: MemoryRecord[];
     /** 존재하지 않는 슬러그를 가리키는 위키링크 — 연결이 끊긴 채 방치된 기억 */
     danglingLinks: { slug: string; targets: string[] }[];
+    /** 공고화 후보 — 같은 주제를 반복 겪은 일화 묶음 (T35) */
+    consolidationCandidates: { theme: string; slugs: string[] }[];
   } {
     const all = this.loadAll(true);
     const byType: Record<string, number> = {};
@@ -791,6 +818,31 @@ export class MemoryStore {
     const danglingLinks = active
       .map((m) => ({ slug: m.slug, targets: this.danglingLinks(m) }))
       .filter((x) => x.targets.length > 0);
+
+    // 공고화 후보 (T35) — 사람의 뇌는 같은 일을 반복 겪으면 개별 일화에서 규칙을 뽑는다.
+    //
+    // **서버는 후보만 내고 추상화는 하지 않는다.** 자동 일반화는 P8(허위기억 배제)과
+    // P6(자동 파괴 금지)을 동시에 위협한다 — 세 건이 겹친다고 규칙이 참인 것은 아니다.
+    // 어느 것이 진짜 패턴인지는 본문을 읽어야 알 수 있고, 그건 모델의 일이다.
+    //
+    // 후보 조건: 아직 공고화되지 않은 **일화(episodic)** 가 한 태그 아래 3건 이상.
+    // 태그를 축으로 삼는 이유는 그것이 사용자가 명시한 주제 신호이기 때문이다 —
+    // 토큰 유사도로 묶으면 표층이 닮았을 뿐인 무관한 기억이 한 묶음이 된다(감사 D3 의 교훈).
+    const CONSOLIDATION_MIN = 3;
+    const alreadyDerived = new Set(active.flatMap((m) => m.derivedFrom ?? []));
+    const byTag = new Map<string, string[]>();
+    for (const m of active) {
+      if (m.type !== "episodic" || alreadyDerived.has(m.slug)) continue;
+      for (const t of m.tags) {
+        if (!byTag.has(t)) byTag.set(t, []);
+        byTag.get(t)?.push(m.slug);
+      }
+    }
+    const consolidationCandidates = [...byTag.entries()]
+      .filter(([, slugs]) => slugs.length >= CONSOLIDATION_MIN)
+      .map(([theme, slugs]) => ({ theme, slugs: slugs.sort() }))
+      .sort((a, b) => b.slugs.length - a.slugs.length);
+
     return {
       counts: { total: all.length, byType, byStatus },
       weakened,
@@ -800,6 +852,7 @@ export class MemoryStore {
       duplicates,
       orphans,
       danglingLinks,
+      consolidationCandidates,
     };
   }
 

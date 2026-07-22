@@ -41,6 +41,20 @@ export interface MemoryRecord {
   project?: string;
   /** 연결된 기억의 slug 목록 (연상 네트워크) */
   links: string[];
+  /**
+   * 공고화 출처 — 이 기억이 어떤 에피소드들에서 **추상화**돼 나왔는지 (T35).
+   *
+   * 사람의 뇌는 휴식·수면 중 해마의 개별 에피소드를 재생해 신피질의 의미기억으로
+   * 추상화한다. BBM 에는 그 전이 경로가 없었다 — `type` 은 생성 시 한 번 정해지고
+   * 어디서도 바뀌지 않았다.
+   *
+   * **P8 과의 긴장을 여기서 푼다.** 추상화 자체는 위반이 아니다. *추상화가 원본을
+   * 대체하는 것*이 위반이다(인간 기억의 버그는 원본 에피소드가 소실되고 스키마만
+   * 남는 것이다). 그래서 파생물은 원본을 **한 바이트도 바꾸지 않고** 새 파일로만
+   * 생기며, 이 필드가 근거를 영구히 붙들어 둔다. frontmatter 에 두는 이유가 그것이다 —
+   * 본문에만 적으면 revise 한 번에 출처가 사라져 손으로 쓴 단정문과 구별되지 않는다.
+   */
+  derivedFrom?: string[];
   supersedes?: string;
   supersededBy?: string;
   archiveReason?: string;
@@ -61,6 +75,8 @@ export interface RememberInput {
   source?: string;
   project?: string;
   supersedes?: string;
+  /** 이 기억이 추상화한 근거 에피소드들의 slug (T35 공고화) */
+  derivedFrom?: string[];
 }
 
 export interface ReviseInput {
@@ -71,6 +87,13 @@ export interface ReviseInput {
   confidence?: number;
   source?: string;
   project?: string;
+  /**
+   * 기억 유형 교정 (T35).
+   * 종전에는 `type` 이 생성 시 한 번 정해진 뒤 **어디서도 바뀌지 않아 오분류조차 고칠 수
+   * 없었다.** 사람의 기억은 반복 경험이 쌓이면 일화가 의미로 넘어간다 — 그 전이를
+   * 표현할 길이 없었다는 뜻이다.
+   */
+  type?: MemoryType;
   reason: string;
 }
 
@@ -88,4 +111,10 @@ export interface SearchResult {
   snippet: string;
   /** 측면억제(RIF)로 순위가 눌렸는지 */
   inhibited?: boolean;
+  /**
+   * 누구에게 눌렸는지 (slug). 억제는 순위를 절반으로 깎는 강한 효과인데 종전에는
+   * 눌렸다는 사실만 알 뿐 **주체를 알 수 없어** 오억제를 추적할 수 없었다.
+   * 공고화 도입 후에는 특히 중요하다 — "파생물이 근거를 눌렀는가" 가 P8 계약이기 때문이다.
+   */
+  inhibitedBy?: string;
 }

@@ -118,6 +118,9 @@ function buildCommands(vaultDir, explicit) {
   return {
     SessionStart: `${base} --start ${flag} "${vault}"`,
     Stop: `${base} --stop ${flag} "${vault}"`,
+    // 부호화 큐 (T34) — 턴 **시작** 시점에 나가야 원문이 아직 살아 있다.
+    // Stop 은 세션 끝이라 이미 늦고, 압축됐다면 요약에서 재구성하게 된다(P8 위반).
+    UserPromptSubmit: `${base} --prompt ${flag} "${vault}"`,
   };
 }
 
@@ -213,9 +216,13 @@ try {
 
 const hooks = settings.hooks && typeof settings.hooks === "object" ? settings.hooks : {};
 
-// SessionStart(회상) 와 Stop(무저장 감지) 을 한 벌로 다룬다 — 둘은 마커 파일로 짝을 이룬다
+// 세 훅을 한 벌로 다룬다 — 전부 같은 마커 파일로 세션 상태를 공유한다.
+//   SessionStart    회상 트리거 (볼트 인덱스 주입)
+//   UserPromptSubmit 부호화 큐 (턴 시작 — 원문이 아직 살아 있는 시점)
+//   Stop            무저장 감지 (안전망, 세션 끝)
 const results = {
   SessionStart: applyHook(hooks, "SessionStart", commands.SessionStart),
+  UserPromptSubmit: applyHook(hooks, "UserPromptSubmit", commands.UserPromptSubmit),
   Stop: applyHook(hooks, "Stop", commands.Stop),
 };
 if (Object.keys(hooks).length === 0) delete settings.hooks;
@@ -236,9 +243,13 @@ if (Object.values(results).every((r) => r.unchanged)) {
 }
 
 if (!REMOVE) {
+  // commands 를 그대로 순회한다 — 하드코딩하면 훅을 늘렸을 때 표시가 조용히 빠진다
+  // (실제로 UserPromptSubmit 추가 시 "추가" 로 집계되면서 명령 목록에는 안 나왔다)
   console.log(`\n등록할 명령:`);
-  console.log(`  SessionStart : ${commands.SessionStart}`);
-  console.log(`  Stop         : ${commands.Stop}`);
+  const width = Math.max(...Object.keys(commands).map((k) => k.length));
+  for (const [event, cmd] of Object.entries(commands)) {
+    console.log(`  ${event.padEnd(width)} : ${cmd}`);
+  }
 }
 console.log("");
 
