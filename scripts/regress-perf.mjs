@@ -97,6 +97,33 @@ console.log("2) 캐시 무효화 정확성");
   check("삭제된 기억은 null", c.resolve(r1.id) === null);
 }
 
+// ── 2-b. 삭제+추가가 겹쳐 파일 수가 그대로여도 캐시가 갱신된다 (T37)
+//
+// 종전 휴리스틱은 **파일 수만** 비교했다. 다른 프로세스가 기억 하나를 지우고
+// 하나를 새로 만들면 수가 같아 캐시를 신뢰했고, 새 기억의 id 조회가
+// "볼트 무변화 → 정말 없음" 분기로 null 을 오답했다.
+console.log("2-b) 삭제+추가 동수 변화 감지 (T37)");
+{
+  const dir = freshDir();
+  const a = new MemoryStore(new Vault(dir));
+  const keep = a.remember({ title: "유지되는 기억", content: "본문.", type: "semantic" }).record;
+  const doomed = a.remember({ title: "지워질 기억", content: "본문.", type: "semantic" }).record;
+  check("캐시 구축(선행 조회)", a.resolve(keep.id)?.record?.id === keep.id);
+
+  // 다른 프로세스: doomed 를 외부 삭제하고(unlinkSync — 2절의 rmSync 즉사 참고) 새 기억을 추가
+  fs.unlinkSync(path.join(dir, "memories", `${doomed.slug}.md`));
+  const b = new MemoryStore(new Vault(dir));
+  const fresh = b.remember({ title: "새로 생긴 기억", content: "본문.", type: "semantic" }).record;
+
+  // ★ 패치 전 실패: 파일 수가 2로 동일 → 캐시 신뢰 → null
+  check("파일 수가 같아도 새 기억을 id 로 찾음", a.resolve(fresh.id)?.record?.id === fresh.id, "동수 변화를 캐시가 못 봄");
+  check("지워진 기억은 null", a.resolve(doomed.id) === null);
+  check("살아 있는 기억은 계속 조회됨", a.resolve(keep.id)?.record?.id === keep.id);
+
+  // 재구축 후 볼트가 그대로면 부정 조회 고속 경로도 여전히 작동
+  check("없는 id 는 여전히 null", a.resolve("mem-여전히-없는-id") === null);
+}
+
 // ── 3. history 상한 (F4)
 console.log("3) history 상한 (F4)");
 {

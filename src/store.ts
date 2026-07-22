@@ -402,8 +402,25 @@ export class MemoryStore {
    * 한 번 스캔한 결과를 기억해 두고, 미스일 때만 다시 훑는다.
    */
   private idIndex: Map<string, string> | null = null;
-  /** 인덱스를 만든 시점의 노트 파일 수 — 볼트가 변했는지 싸게 판정한다 */
-  private idIndexSize = -1;
+  /**
+   * 인덱스를 만든 시점의 볼트 시그니처 — 볼트가 변했는지 싸게 판정한다.
+   *
+   * 종전에는 **파일 수만** 비교했는데, 삭제 1건 + 추가 1건이 겹치면 수가 그대로라
+   * 캐시를 신뢰했고, 새로 추가된 기억의 id 조회가 null 로 오답했다(풀스캔 생략 분기).
+   * 시그니처는 listSlugs 가 이미 치른 readdir 결과의 (위치, slug) 정렬 결합이므로
+   * 추가 비용 없이 추가·삭제·이동·개명을 전부 잡는다.
+   * 남는 구멍은 "같은 파일명 안에서 id 필드만 손편집" 뿐인데, 그 경우도 히트 쪽은
+   * verify 가 재읽기로 걸러낸다 — 놓치는 것은 새 id 의 부정 조회가 한 번 늦는 것뿐이다.
+   */
+  private idIndexSig: string | null = null;
+
+  /** readdir 결과만으로 만드는 볼트 변화 시그니처 — 파싱 없음, 파일 수 비교와 같은 비용 */
+  private vaultSignature(slugs: { slug: string; archived: boolean }[]): string {
+    return slugs
+      .map(({ slug, archived }) => `${archived ? "a" : "m"}:${slug}`)
+      .sort()
+      .join("\n");
+  }
 
   private buildIdIndex(): Map<string, string> {
     const slugs = this.vault.listSlugs(true);
@@ -413,7 +430,7 @@ export class MemoryStore {
       if (rec) idx.set(rec.id, slug);
     }
     this.idIndex = idx;
-    this.idIndexSize = slugs.length;
+    this.idIndexSig = this.vaultSignature(slugs);
     return idx;
   }
 
@@ -422,9 +439,8 @@ export class MemoryStore {
    *
    * 없는 id 도 정확히 없다고 답해야 하므로, 캐시 미스가 "정말 없음" 인지
    * "다른 프로세스가 그 사이 추가함" 인지 구분해야 한다. 전량 재파싱 대신
-   * **파일 수만 세어**(readdir 2회) 볼트 변화를 감지한다 — 수가 그대로면 캐시를 믿고,
-   * 달라졌으면 다시 만든다. 파일 수가 같은 이동(forget: memories→archive)은
-   * vault.find 가 양쪽을 모두 보므로 문제되지 않는다.
+   * readdir 시그니처(위치+slug)로 볼트 변화를 감지한다 — 그대로면 캐시를 믿고,
+   * 달라졌으면 다시 만든다. 수만 비교하던 종전 방식은 삭제+추가가 겹치면 못 봤다.
    */
   resolve(idOrSlug: string): { record: MemoryRecord; archived: boolean } | null {
     const bySlug = this.vault.find(idOrSlug);
@@ -440,7 +456,7 @@ export class MemoryStore {
       const hit = verify(this.idIndex.get(idOrSlug));
       if (hit) return hit;
       // 미스 — 볼트가 그대로면 정말 없는 것이다 (풀스캔 생략)
-      if (this.vault.listSlugs(true).length === this.idIndexSize) return null;
+      if (this.vaultSignature(this.vault.listSlugs(true)) === this.idIndexSig) return null;
     }
     return verify(this.buildIdIndex().get(idOrSlug));
   }
