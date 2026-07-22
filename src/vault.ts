@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import matter from "gray-matter";
+import { logWarn } from "./log.js";
 import type { MemoryRecord, MemoryStatus, MemoryType } from "./types.js";
 
 /** Windows 예약 장치명 (대소문자 무관) — 파일명 어간으로 쓰면 안 된다 */
@@ -216,7 +217,7 @@ export class Vault {
     try {
       raw = fs.readFileSync(fp, "utf-8");
     } catch (err) {
-      console.error(`[BigBrainMemory] 읽기 실패(건너뜀): ${slug} — ${errText(err)}`);
+      logWarn(`읽기 실패(건너뜀): ${slug} — ${errText(err)}`);
       this.readCache.delete(fp);
       return null;
     }
@@ -256,11 +257,9 @@ export class Vault {
       const stamp = new Date().toISOString().replace(/[:.]/g, "-");
       const to = path.join(this.quarantineDir, `${slug}.${stamp}.md`);
       fs.renameSync(from, to);
-      console.error(`[BigBrainMemory] 손상 파일 격리: ${slug} — ${reason} → ${to}`);
+      logWarn(`손상 파일 격리: ${slug} — ${reason} → ${to}`);
     } catch (err) {
-      console.error(
-        `[BigBrainMemory] 손상 파일 격리 실패(건너뜀): ${slug} — ${reason} / ${errText(err)}`,
-      );
+      logWarn(`손상 파일 격리 실패(건너뜀): ${slug} — ${reason} / ${errText(err)}`);
     }
   }
 
@@ -395,7 +394,7 @@ export class Vault {
       }
     } catch (err) {
       // 스냅샷 실패가 교정 자체를 막지는 않는다 — 경고만 남긴다
-      console.error(`[BigBrainMemory] 교정 전 스냅샷 실패(계속 진행): ${slug} — ${errText(err)}`);
+      logWarn(`교정 전 스냅샷 실패(계속 진행): ${slug} — ${errText(err)}`);
     }
   }
 

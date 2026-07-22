@@ -9,9 +9,33 @@ import { z } from "zod";
 import { Vault } from "./vault.js";
 import { MemoryStore } from "./store.js";
 import { initUsageLog, logUsage, queryField } from "./usage.js";
+import { logError, logInfo, logWarn } from "./log.js";
 import type { MemoryRecord, SearchResult } from "./types.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+
+/** 버전은 package.json 이 단일 출처다 — 종전에는 여기 하드코딩돼 이중 관리였다 (T39) */
+const PKG_VERSION = (() => {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.resolve(here, "..", "package.json"), "utf-8"));
+    return typeof pkg.version === "string" ? pkg.version : "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+})();
+
+/**
+ * 빌드 스탬프 — 실행 중인 서버가 **어느 빌드**인지. MCP 서버는 세션보다 오래 사는데
+ * 버전 문자열은 커밋마다 바뀌지 않아서, "고쳤는데 왜 그대로지" 가 재시작 필요 여부를
+ * 확인할 방법 없이 반복됐다. 자기 파일(dist/index.js)의 mtime 이 곧 빌드 시각이다.
+ */
+const BUILD_STAMP = (() => {
+  try {
+    return fs.statSync(fileURLToPath(import.meta.url)).mtime.toISOString();
+  } catch {
+    return "unknown";
+  }
+})();
 const vaultDir = process.env.BIGBRAIN_VAULT
   ? path.resolve(process.env.BIGBRAIN_VAULT)
   : path.resolve(here, "..", "vault");
@@ -169,7 +193,7 @@ function vaultState(): { state: StateBlock[]; items: string[]; total: number } {
     list = store.list(DEFAULT_PROJECT ? { project: DEFAULT_PROJECT } : undefined);
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
-    console.error(`[BigBrainMemory] 인덱스 요약 실패(계속 진행): ${detail}`);
+    logWarn(`인덱스 요약 실패(계속 진행): ${detail}`);
     // 빈 배열을 돌려주면 모델은 기억 상태 신호를 하나도 못 받는다 — 실패 사실이라도 전한다
     return {
       state: [
@@ -276,16 +300,12 @@ function buildInstructions(): string {
 
   if (text.length > INSTRUCTIONS_BUDGET) {
     // 고정부만으로 예산을 넘는 경우 — 잘림을 클라이언트에 맡기지 않고 알린다
-    console.error(
-      `[BigBrainMemory] instructions ${text.length}자 — 예산 ${INSTRUCTIONS_BUDGET} 초과. 클라이언트가 뒷부분을 자를 수 있습니다.`,
-    );
+    logWarn(`instructions ${text.length}자 — 예산 ${INSTRUCTIONS_BUDGET} 초과. 클라이언트가 뒷부분을 자를 수 있습니다.`);
   }
   // 예산 안에 들어왔더라도 **무언가를 버렸으면 말한다.** 최종 길이만 보고 판단하면
   // 버린 덕분에 예산에 들어온 경우가 정상으로 보인다 — 그 침묵이 위 회귀를 6주간 숨겼다.
   if (degraded.length > 0) {
-    console.error(
-      `[BigBrainMemory] instructions 예산 ${INSTRUCTIONS_BUDGET}자에 맞추려고 볼트 상태를 줄였습니다 (${text.length}자): ${degraded.join(", ")}`,
-    );
+    logWarn(`instructions 예산 ${INSTRUCTIONS_BUDGET}자에 맞추려고 볼트 상태를 줄였습니다 (${text.length}자): ${degraded.join(", ")}`);
   }
   return text;
 }
@@ -293,7 +313,7 @@ function buildInstructions(): string {
 const INSTRUCTIONS = buildInstructions();
 
 const server = new McpServer(
-  { name: "bigbrainmemory", version: "0.1.0" },
+  { name: "bigbrainmemory", version: PKG_VERSION },
   { instructions: INSTRUCTIONS },
 );
 
@@ -771,9 +791,7 @@ async function main() {
   try {
     store.regenerateIndex();
   } catch (err) {
-    console.error(
-      `[BigBrainMemory] 인덱스 재생성 실패(계속 진행): ${err instanceof Error ? err.message : String(err)}`,
-    );
+    logWarn(`인덱스 재생성 실패(계속 진행): ${err instanceof Error ? err.message : String(err)}`);
   }
   const transport = new StdioServerTransport();
   await server.connect(transport);
@@ -783,23 +801,21 @@ async function main() {
   if (st.archived > 0) parts.push(`archived=${st.archived}`);
   if (st.quarantined > 0) parts.push(`quarantined=${st.quarantined}(!)`);
   if (DEFAULT_PROJECT) parts.push(`project=${DEFAULT_PROJECT}`);
-  console.error(`[BigBrainMemory] ready. vault=${vaultDir} ${parts.join(" ")}`);
-  if (VAULT_WARNING) console.error(`[BigBrainMemory] ${VAULT_WARNING}`);
+  logInfo(`ready. v${PKG_VERSION} built=${BUILD_STAMP} vault=${vaultDir} ${parts.join(" ")}`);
+  if (VAULT_WARNING) logWarn(VAULT_WARNING);
   if (HOOK_WARNING) {
-    console.error(
-      `[BigBrainMemory] SessionStart 훅이 설치돼 있지 않습니다. 대조 실험 40회에서 훅이 있으면 20/20, ` +
+    logWarn(
+      `SessionStart 훅이 설치돼 있지 않습니다. 대조 실험 40회에서 훅이 있으면 20/20, ` +
         `없으면 13/20 이 저장됐습니다 — instructions 만으로는 저장이 잘 일어나지 않습니다. ` +
         `BigBrainMemory 저장소에서 \`npm run setup:hook\` 을 실행해 주세요.`,
     );
   }
   if (st.quarantined > 0) {
-    console.error(
-      `[BigBrainMemory] 격리된 손상 파일 ${st.quarantined}건이 있습니다 — vault/quarantine/ 확인 필요`,
-    );
+    logWarn(`격리된 손상 파일 ${st.quarantined}건이 있습니다 — vault/quarantine/ 확인 필요`);
   }
 }
 
 main().catch((err) => {
-  console.error("[BigBrainMemory] fatal:", err);
+  logError("fatal", err);
   process.exit(1);
 });

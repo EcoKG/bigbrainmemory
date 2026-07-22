@@ -1,4 +1,5 @@
 import { Vault } from "./vault.js";
+import { logWarn } from "./log.js";
 import type {
   MemoryRecord,
   MemoryStatus,
@@ -1033,9 +1034,7 @@ export class MemoryStore {
       }
       this.vault.write(target, fresh.archived); // forget 으로 이동했으면 archive 쪽에 기록
     } catch (err) {
-      console.error(
-        `[BigBrainMemory] 강화 기록 실패(무시): ${m.slug} — ${err instanceof Error ? err.message : String(err)}`,
-      );
+      logWarn(`강화 기록 실패(무시): ${m.slug} — ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
