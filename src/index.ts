@@ -8,6 +8,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { Vault } from "./vault.js";
 import { MemoryStore } from "./store.js";
+import { initUsageLog, logUsage, queryField } from "./usage.js";
 import type { MemoryRecord, SearchResult } from "./types.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -17,6 +18,7 @@ const vaultDir = process.env.BIGBRAIN_VAULT
 
 const vault = new Vault(vaultDir);
 const store = new MemoryStore(vault);
+initUsageLog(vaultDir);
 
 /**
  * 볼트가 "지정됐는데 비어 있고 마커도 없는" 상태면 경로 오타/드라이브 이동을 의심한다 (감사 E3).
@@ -435,6 +437,16 @@ server.registerTool(
     // (씌우면 "전역이면 생략" 이라는 도구 설명과 모순되고, 사용자 선호 같은
     //  범용 지식이 한 프로젝트에 갇혀 다른 곳에서 조용히 회상되지 않는다)
     const { record, similar, dangling } = store.remember(args);
+    logUsage({
+      tool: "remember",
+      ok: true,
+      type: args.type,
+      scoped: args.project !== undefined,
+      similarCount: similar.length,
+      danglingCount: dangling.length,
+      hasSource: args.source !== undefined,
+      confidence: record.confidence,
+    });
     // 깨진 링크는 **보고만** 한다 — 아직 안 쓴 기억을 미리 가리키는 선행 참조는
     // 정상이므로 저장을 막으면 안 된다. 다만 모르고 지나가면 볼트가 조용히 썩는다.
     const hints = [
@@ -485,6 +497,16 @@ server.registerTool(
       includeLinked: include_linked,
       project: scope,
     });
+    // 0건 비율은 검색 품질의 1차 지표다 — 회상이 실패하는지 아예 안 불리는지를 가른다
+    logUsage({
+      tool: "recall",
+      ok: true,
+      resultCount: results.length,
+      totalMatched,
+      zeroHit: results.length === 0,
+      scoped: scope !== undefined,
+      ...queryField(query),
+    });
     if (results.length === 0) {
       // 0건에 곧장 remember 를 권하면 "사실은 있는데 표현이 어긋난" 기억이 중복 저장된다.
       // 재질의를 먼저 유도한다 (감사 D2).
@@ -517,6 +539,7 @@ server.registerTool(
   },
   async ({ id }) => {
     const m = store.read(id);
+    logUsage({ tool: "read_memory", ok: m !== null });
     if (!m) return fail(`Memory not found: ${id}`);
     return ok(full(m));
   },
@@ -546,6 +569,13 @@ server.registerTool(
   },
   async ({ id, reason, content, title, description, tags, confidence, source, project }) => {
     const m = store.revise(id, { reason, content, title, description, tags, confidence, source, project });
+    // revise 호출률은 자기교정 루프가 도는지의 지표다 — 낡은 기억이 방치되는지 여기서 드러난다
+    logUsage({
+      tool: "revise",
+      ok: m !== null,
+      contentChanged: content !== undefined,
+      confidenceChanged: confidence !== undefined,
+    });
     if (!m) return fail(`Memory not found: ${id}`);
     return ok({ revised: full(m) });
   },
@@ -565,6 +595,7 @@ server.registerTool(
   },
   async ({ id, reason }) => {
     const m = store.forget(id, reason);
+    logUsage({ tool: "forget", ok: m !== null });
     if (!m) return fail(`Memory not found: ${id}`);
     return ok({ forgotten: brief(m), archived_to: `archive/${m.slug}.md` });
   },
@@ -585,6 +616,7 @@ server.registerTool(
   },
   async ({ source, target, relation }) => {
     const linked = store.link(source, target, relation);
+    logUsage({ tool: "link", ok: linked !== null, hasRelation: relation !== undefined });
     if (!linked) return fail(`Could not link: one of [${source}, ${target}] not found, or they are the same memory.`);
     return ok({ linked: { source: brief(linked.source), target: brief(linked.target), relation } });
   },
@@ -601,6 +633,15 @@ server.registerTool(
   },
   async () => {
     const r = store.reflect();
+    logUsage({
+      tool: "reflect",
+      ok: true,
+      total: r.counts.total,
+      duplicates: r.duplicates.length,
+      orphans: r.orphans.length,
+      forgetCandidates: r.forgetCandidates.length,
+      brokenLinks: r.danglingLinks.length,
+    });
     return ok({
       counts: r.counts,
       weakened_hard_to_recall: r.weakened,
@@ -638,6 +679,7 @@ server.registerTool(
   async ({ type, status, project }) => {
     const scope = project === undefined ? DEFAULT_PROJECT : project || undefined;
     const items = store.list({ type, status, project: scope });
+    logUsage({ tool: "list_memories", ok: true, resultCount: items.length, scoped: project !== undefined });
     return ok({ count: items.length, memories: items.map(brief) });
   },
 );

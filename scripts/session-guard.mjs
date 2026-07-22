@@ -260,13 +260,40 @@ function readMarker() {
         // 구형 마커에는 없다 — 없으면 손실 검사를 건너뛴다(오경보보다 침묵이 낫다)
         total: Number.isFinite(o.total) ? o.total : Number.NaN,
         warned: o.warned === true,
+        /** 무저장 결과를 계측 로그에 남겼는가 (Stop 이 매 턴 발화하므로 1회 제한) */
+        logged: o.logged === true,
+        /** 저장 결과를 남겼는가 — 무저장 기록과 별개다(경고 뒤 저장한 세션을 잡기 위해) */
+        loggedStored: o.loggedStored === true,
       };
     }
   } catch {
     /* 구형 포맷 — 아래에서 숫자로 해석 */
   }
   const n = Number.parseInt(raw, 10);
-  return Number.isFinite(n) ? { sessionId: null, count: n, total: Number.NaN, warned: false } : null;
+  return Number.isFinite(n) ? { sessionId: null, count: n, total: Number.NaN, warned: false, logged: false } : null;
+}
+
+/**
+ * 사용 계측 — 서버와 **같은 로그 파일**에 세션 단위 사건을 남긴다 (T33).
+ *
+ * 왜 훅이 기록하는가: 저장률의 분모인 "세션" 을 아는 것은 훅뿐이다. stdio 서버는 세션
+ * 개념이 없고(프로세스가 곧 세션에 가까운 근사일 뿐), `session_id` 는 훅 입력으로만 온다.
+ * 게다가 Stop 훅은 이미 "이 세션에서 새로 저장됐는가" 를 계산하고 있다 — A/B 1차 지표를
+ * 이미 손에 쥐고 있으면서 버리고 있었다.
+ *
+ * 내용은 남기지 않는다. 수치와 식별자뿐이다.
+ */
+function logUsage(event) {
+  if (process.env.BIGBRAIN_USAGE_LOG === "0") return;
+  try {
+    fs.appendFileSync(
+      path.join(vaultDir, ".bbm-usage.jsonl"),
+      `${JSON.stringify({ ts: new Date().toISOString(), src: "hook", ...event })}\n`,
+      "utf-8",
+    );
+  } catch {
+    /* 계측 실패가 훅을 망가뜨리면 안 된다 */
+  }
 }
 
 function writeMarker(m) {
@@ -303,7 +330,19 @@ if (mode === "start") {
   // 새 세션에서만 본다(같은 세션 안의 재개·압축에서 반복 경고하지 않도록).
   const lost = !sameSession && prev && Number.isFinite(prev.total) && prev.total > total ? prev.total - total : 0;
 
-  if (!sameSession) writeMarker({ sessionId: hookInput.sessionId, count, total, warned: false });
+  if (!sameSession) {
+    writeMarker({ sessionId: hookInput.sessionId, count, total, warned: false });
+    // 새 세션의 시작만 기록한다 — resume/compact 재발화까지 세면 분모가 부풀어
+    // 저장률이 실제보다 낮게 나온다
+    logUsage({
+      event: "session_start",
+      sessionId: hookInput.sessionId,
+      source: hookInput.source,
+      count,
+      total,
+      ...(lost > 0 ? { lost } : {}),
+    });
+  }
 
   // 볼트 디렉터리 자체가 없으면 침묵한다. 이건 콜드 스타트가 아니라 **설정이 어긋난**
   // 상태이고(경로 오타, 아직 이 프로젝트에 붙이지 않음), 그걸 매 세션 떠들면 노이즈다.
@@ -413,7 +452,32 @@ if (!m || !Number.isFinite(m.count)) process.exit(0);
 // (여러 세션이 한 볼트를 공유하면 마커는 마지막 SessionStart 것이다)
 if (hookInput.sessionId && m.sessionId && hookInput.sessionId !== m.sessionId) process.exit(0);
 
-if (countMemories() > m.count) process.exit(0); // 저장됐다 — 조용히 통과
+// 도구 호출 수는 "실제로 작업한 세션인가" 의 근사다 — 계측의 분모를 가르는 값이라
+// 경고 게이트보다 먼저 재둔다(못 재면 null).
+const toolUses = (() => {
+  if (!hookInput.transcriptPath) return null;
+  try {
+    return (fs.readFileSync(hookInput.transcriptPath, "utf-8").match(/"type"\s*:\s*"tool_use"/g) ?? []).length;
+  } catch {
+    return null;
+  }
+})();
+
+const stored = countMemories() - m.count;
+if (stored > 0) {
+  // 저장됐다 — 조용히 통과하되 **결과는 기록한다.** 이 값이 A/B 의 1차 지표(저장률)다.
+  //
+  // 두 개의 플래그를 쓰는 이유: Stop 은 매 턴 발화하므로 무제한 기록하면 턴 수만큼
+  // 부풀지만, 반대로 "한 번 기록했으면 끝" 으로 두면 **경고를 받고 나서 저장한 세션이
+  // 영원히 저장 0 으로 남는다.** 그건 우리가 유도하려는 바로 그 행동이므로 놓치면
+  // 지표가 개선을 못 잡는다. 그래서 무저장 기록과 저장 기록을 따로 1회씩 허용하고,
+  // 리포트가 세션별로 최대값을 취해 최종 결과를 쓴다.
+  if (!m.loggedStored) {
+    writeMarker({ ...m, logged: true, loggedStored: true });
+    logUsage({ event: "session_end", sessionId: m.sessionId, stored, toolUses, warned: m.warned === true });
+  }
+  process.exit(0);
+}
 
 // **Stop 은 세션 끝이 아니라 매 턴 발화한다.** 그대로 두면 저장 전까지 모든 응답마다
 // 같은 경고가 반복돼, 정작 봐야 할 신호가 소음에 묻힌다(경보 피로).
@@ -422,23 +486,31 @@ if (m.warned) process.exit(0);
 
 // 실제로 작업한 세션에만 말을 건다 — 도구 호출 수로 판정한다(위 상수 주석 참고).
 // 못 재면 종전대로 알린다(모른다고 침묵하면 안전망 자체가 사라진다).
-if (hookInput.transcriptPath && MIN_TOOL_USES > 0) {
+if (hookInput.transcriptPath && MIN_TOOL_USES > 0 && toolUses !== null) {
+  // 서브에이전트에 위임한 세션은 **부모 트랜스크립트에 호출 흔적이 거의 없다.**
+  // 실제 작업은 별도 컨텍스트에서 벌어졌는데 부모 기준으로는 한두 번 부른 잡담처럼
+  // 보여 게이트에 걸린다. 위임 자체를 작업 신호로 취급해 게이트를 통과시킨다.
+  // (위임이 저장을 억제하는지는 아직 미측정이다 — 여기서 침묵하면 그 측정 자체가
+  //  오염되므로, 제품 효과가 아니라 관측 가능성을 위해 넣는다)
+  let delegated = false;
   try {
-    const raw = fs.readFileSync(hookInput.transcriptPath, "utf-8");
-    const uses = (raw.match(/"type"\s*:\s*"tool_use"/g) ?? []).length;
-    // 서브에이전트에 위임한 세션은 **부모 트랜스크립트에 호출 흔적이 거의 없다.**
-    // 실제 작업은 별도 컨텍스트에서 벌어졌는데 부모 기준으로는 한두 번 부른 잡담처럼
-    // 보여 게이트에 걸린다. 위임 자체를 작업 신호로 취급해 게이트를 통과시킨다.
-    // (위임이 저장을 억제하는지는 아직 미측정이다 — 여기서 침묵하면 그 측정 자체가
-    //  오염되므로, 제품 효과가 아니라 관측 가능성을 위해 넣는다)
-    const delegated = /"name"\s*:\s*"(Agent|Task)"/.test(raw);
-    if (uses < MIN_TOOL_USES && !delegated) process.exit(0);
+    delegated = /"name"\s*:\s*"(Agent|Task)"/.test(fs.readFileSync(hookInput.transcriptPath, "utf-8"));
   } catch {
     /* 못 읽음 — 게이트를 통과시킨다 */
   }
+  if (toolUses < MIN_TOOL_USES && !delegated) {
+    // 잡담 세션은 경고하지 않지만 **분모에서 빼지도 않는다.** 저장률을 계산할 때
+    // "작업 세션" 만 세려면 이 구분이 로그에 남아 있어야 한다.
+    if (!m.logged) {
+      writeMarker({ ...m, logged: true });
+      logUsage({ event: "session_end", sessionId: m.sessionId, stored: 0, toolUses, warned: false, belowGate: true });
+    }
+    process.exit(0);
+  }
 }
 
-writeMarker({ ...m, warned: true });
+writeMarker({ ...m, warned: true, logged: true });
+logUsage({ event: "session_end", sessionId: m.sessionId, stored: 0, toolUses, warned: true });
 
 // **평문 stdout 으로 내면 아무에게도 도달하지 않는다.** 공식 문서:
 //   "For most events, stdout is written to the debug log but not shown in the transcript.
