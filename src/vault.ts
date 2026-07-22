@@ -129,6 +129,45 @@ export class Vault {
     fs.mkdirSync(this.archiveDir, { recursive: true });
   }
 
+  /**
+   * 파싱 캐시 (T38) — loadAll 이 질의마다 볼트 전체를 YAML 파싱하던 상수 비용을 없앤다
+   * (950건 규모 실측에서 질의당 수백 ms~수 초, RIF 를 고쳐도 이것이 남는다).
+   *
+   * 키는 파일 경로, 유효성은 (ino, mtimeNs, size) **전부** 일치:
+   *   - writeFileAtomic 은 임시 파일 rename 이라 매 쓰기가 새 inode 를 만든다 —
+   *     자기 쓰기든 다른 BBM 프로세스의 쓰기든 ino 변화로 반드시 잡힌다.
+   *   - Obsidian 등의 제자리 편집은 mtime/size 로 잡힌다 (NTFS·ext4 의 mtime 은
+   *     ns 급이라 실질 무결). 알려진 한계: mtime 이 초 단위인 파일시스템(FAT 계열)에서
+   *     같은 길이의 제자리 편집이 같은 초 안에 두 번 일어나면 못 본다.
+   *   - stat 을 읽기 **전에** 뜬다 — 읽기 후에 뜨면 "옛 내용 + 새 stat" 이 캐시돼
+   *     다음 변경까지 낡은 값이 서빙된다. 반대 순서는 최악이 재파싱 1회다.
+   *
+   * 반환은 항상 구조 클론이다 — reinforce/revise/remember 가 받은 레코드를 변이한 뒤
+   * write 하므로, 캐시 원본을 그대로 돌려주면 아직 쓰지 않은 변이가 다음 읽기에 비친다.
+   *
+   * gray-matter 모듈 캐시(감사 A2)와 다르다: 그쪽은 **예외로 죽은 반쪽 파싱**을 내용
+   * 키로 캐시해 세탁 벡터가 됐다. 여기는 성공한 파싱만, 파일 신원 키로 저장하고
+   * 실패 경로는 항상 항목을 지운다.
+   */
+  private readCache = new Map<string, { ino: bigint; mtimeNs: bigint; size: bigint; record: MemoryRecord }>();
+
+  /**
+   * 레코드 클론 — structuredClone 보다 약 30% 빠르다(950건 웜 loadAll 155→108ms 실측).
+   * MemoryRecord 가 원시값 + 문자열 배열뿐이라는 전제 위의 최적화다.
+   * 중첩 객체 필드를 새로 추가하면 이 함수도 함께 고쳐야 한다 —
+   * regress-cache.mjs 2절이 레코드의 **모든 필드를 동적으로 순회**하며 변이 격리를
+   * 검사하므로, 빠뜨리면 여기가 아니라 테스트가 먼저 알려준다.
+   */
+  private cloneRecord(r: MemoryRecord): MemoryRecord {
+    return {
+      ...r,
+      tags: [...r.tags],
+      links: [...r.links],
+      history: [...r.history],
+      derivedFrom: r.derivedFrom ? [...r.derivedFrom] : undefined,
+    };
+  }
+
   listSlugs(includeArchived = false): { slug: string; archived: boolean }[] {
     const out: { slug: string; archived: boolean }[] = [];
     for (const f of fs.readdirSync(this.memoriesDir)) {
@@ -157,29 +196,50 @@ export class Vault {
    */
   read(slug: string, archived = false): MemoryRecord | null {
     const fp = this.filePath(slug, archived);
-    if (!fs.existsSync(fp)) return null;
+    // stat 하나로 존재 확인과 캐시 유효성 판정을 겸한다 (existsSync 별도 호출 불필요)
+    let st: fs.BigIntStats | undefined;
+    try {
+      st = fs.statSync(fp, { bigint: true, throwIfNoEntry: false });
+    } catch {
+      st = undefined;
+    }
+    if (!st) {
+      this.readCache.delete(fp);
+      return null;
+    }
+    const hit = this.readCache.get(fp);
+    if (hit && hit.ino === st.ino && hit.mtimeNs === st.mtimeNs && hit.size === st.size) {
+      return this.cloneRecord(hit.record);
+    }
 
     let raw: string;
     try {
       raw = fs.readFileSync(fp, "utf-8");
     } catch (err) {
       console.error(`[BigBrainMemory] 읽기 실패(건너뜀): ${slug} — ${errText(err)}`);
+      this.readCache.delete(fp);
       return null;
     }
 
     if (raw.trim() === "") {
+      this.readCache.delete(fp);
       this.quarantine(slug, archived, "빈 파일");
       return null;
     }
     if (!hasClosingDelimiter(raw)) {
+      this.readCache.delete(fp);
       this.quarantine(slug, archived, "닫는 frontmatter 구분자(---) 없음 — 쓰기 중 절단 의심");
       return null;
     }
 
     try {
       const { data, content } = matter(raw, MATTER_OPTIONS);
-      return this.fromFrontmatter(slug, data, content.trim());
+      const record = this.fromFrontmatter(slug, data, content.trim());
+      // 캐시에는 클론을 넣는다 — 반환본을 호출부가 변이해도 캐시가 오염되지 않도록
+      this.readCache.set(fp, { ino: st.ino, mtimeNs: st.mtimeNs, size: st.size, record: this.cloneRecord(record) });
+      return record;
     } catch (err) {
+      this.readCache.delete(fp);
       this.quarantine(slug, archived, `frontmatter 파싱 실패: ${errText(err)}`);
       return null;
     }
@@ -214,7 +274,10 @@ export class Vault {
   }
 
   write(record: MemoryRecord, archived = false): void {
-    writeFileAtomic(this.filePath(record.slug, archived), this.serialize(record));
+    const fp = this.filePath(record.slug, archived);
+    writeFileAtomic(fp, this.serialize(record));
+    // 새 inode 라 어차피 미스지만, 명시적으로 지워 어떤 파일시스템에서도 낡은 항목이 남지 않게 한다
+    this.readCache.delete(fp);
   }
 
   /** 레코드를 frontmatter + 본문 마크다운 문자열로 직렬화 (slug 와 무관 — slug 는 파일명) */
@@ -340,7 +403,11 @@ export class Vault {
   moveToArchive(slug: string): void {
     const from = this.filePath(slug, false);
     const to = this.filePath(slug, true);
-    if (fs.existsSync(from)) fs.renameSync(from, to);
+    if (fs.existsSync(from)) {
+      fs.renameSync(from, to);
+      this.readCache.delete(from);
+      this.readCache.delete(to); // 같은 자리에 이전 세대가 캐시돼 있었을 수 있다
+    }
   }
 
   /**
