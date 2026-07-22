@@ -66,6 +66,18 @@ const startEvent = (o = {}) => JSON.stringify({ hook_event_name: "SessionStart",
 const stopEvent = (o = {}) => JSON.stringify({ hook_event_name: "Stop", ...o });
 const readMarkerRaw = (v) => fs.readFileSync(path.join(v, ".bbm-session-start"), "utf-8").trim();
 const addMemory = (v, n) => fs.writeFileSync(path.join(v, "memories", `${n}.md`), "x", "utf-8");
+/**
+ * Stop 훅 출력에서 **모델에 실제로 전달되는 본문**을 꺼낸다 (도달하지 않으면 "").
+ * 평문 문자열을 검사하면 안 된다 — Stop 의 평문 stdout 은 디버그 로그로만 가므로,
+ * 문자열 단언은 "아무에게도 도달하지 않는 경고" 도 통과시킨다(실제 6일간 그랬다).
+ */
+const stopContext = (out) => {
+  try {
+    return JSON.parse(out)?.hookSpecificOutput?.additionalContext ?? "";
+  } catch {
+    return "";
+  }
+};
 
 // ── 1. 실행 시점 볼트 해석 (H1)
 console.log("1) 실행 시점 볼트 해석 — 프로젝트 설정을 따라간다");
@@ -186,7 +198,33 @@ console.log("3) 무저장 감지");
   check("마커에 기준 건수 기록됨", JSON.parse(readMarkerRaw(v)).count === 1, readMarkerRaw(v));
 
   const noSave = run(["--stop", "--vault-force", v], root);
-  check("저장 0건이면 경고", /저장된 기억이 없습니다/.test(noSave.out), noSave.out.slice(0, 200));
+  // ★ **전달 계약을 검사한다.** 종전에는 문구 문자열만 단언했고, 그래서 경고가 평문 stdout 으로
+  // 나가 **아무에게도 도달하지 않는 6일 동안 회귀 스위트가 초록이었다.**
+  // 공식 문서: exit 0 stdout 이 컨텍스트가 되는 이벤트는 UserPromptSubmit/UserPromptExpansion/
+  // SessionStart 뿐이고 Stop 은 아니다. Stop 의 비차단 전달 경로는 JSON 의
+  // hookSpecificOutput.additionalContext 하나뿐이다.
+  let parsed = null;
+  try {
+    parsed = JSON.parse(noSave.out);
+  } catch {
+    /* 아래 단언이 잡는다 */
+  }
+  check("저장 0건이면 경고", parsed !== null, `JSON 파싱 실패: ${noSave.out.slice(0, 200)}`);
+  check("Stop 이벤트로 표기", parsed?.hookSpecificOutput?.hookEventName === "Stop", JSON.stringify(parsed)?.slice(0, 200));
+  check(
+    "모델에 도달하는 필드로 전달(additionalContext)",
+    typeof parsed?.hookSpecificOutput?.additionalContext === "string" && parsed.hookSpecificOutput.additionalContext.length > 0,
+    JSON.stringify(parsed)?.slice(0, 300),
+  );
+  const ctx = parsed?.hookSpecificOutput?.additionalContext ?? "";
+  check("무저장 사실과 현재 건수를 알림", /stored 0 new memories/.test(ctx) && /vault still holds 1/.test(ctx), ctx.slice(0, 200));
+  check("호출할 도구 이름을 정확히 지목", /mcp__[\w-]+__remember/.test(ctx), ctx.slice(0, 300));
+  // 종료 시점 저장은 원칙(트리거 순간 저장)의 대체가 아니라 안전망임을 스스로 밝혀야 한다
+  check("자신이 폴백임을 명시", /fallback/.test(ctx), ctx.slice(-300));
+  // 압축된 세션에서의 회고 저장은 요지 기반 재구성의 뒷문이다 (P8)
+  check("압축 세션에서는 저장하지 말라고 지시", /compacted/.test(ctx) && /store nothing/.test(ctx), ctx.slice(-300));
+  // 세션을 막는 경로(decision:block)는 쓰지 않는다 — 이 파일의 최상위 원칙
+  check("세션을 막지 않음(decision 미사용)", parsed?.decision === undefined && parsed?.continue === undefined, JSON.stringify(parsed)?.slice(0, 200));
   check("경고해도 종료코드 0 (세션을 막지 않음)", noSave.code === 0);
 
   fs.writeFileSync(path.join(v, "memories", "새기억.md"), "z", "utf-8");
@@ -255,7 +293,7 @@ console.log("5) 마커 생명주기 — 재개·압축이 기준선을 지운다
   const v4 = makeVault(root, "M4", 2);
   fs.writeFileSync(path.join(v4, ".bbm-session-start"), "2", "utf-8");
   const legacy = run(["--stop", "--vault-force", v4], root, stopEvent({ session_id: "S9" }));
-  check("구형 숫자 마커도 해석해 경고", /저장된 기억이 없습니다/.test(legacy.out), legacy.out.slice(0, 200));
+  check("구형 숫자 마커도 해석해 경고", stopContext(legacy.out) !== "", legacy.out.slice(0, 200));
 }
 
 // ── 6. 경고 빈도 (H6)
@@ -275,9 +313,10 @@ console.log("6) 경고 빈도 — Stop 은 매 턴 발화한다");
   const spoke = turns.filter((t) => t !== "");
   check("5턴 동안 경고는 1회뿐", spoke.length === 1, `발화 ${spoke.length}회`);
   check("경고는 첫 턴에 나온다", turns[0] !== "", `turns=${JSON.stringify(turns.map((t) => t !== ""))}`);
-  check("세션당 1회임을 문구로 밝힘", /세션당 한 번만/.test(spoke[0] ?? ""), spoke[0]?.slice(0, 200));
-  // 오해 방지: 종전 문구 "0건입니다 (2건 그대로)" 는 0건과 2건이 동시에 등장해 모순처럼 읽혔다
-  check("모순돼 보이던 '0건입니다' 표현 제거", !/0건입니다/.test(spoke[0] ?? ""), spoke[0]?.slice(0, 200));
+  const firstCtx = stopContext(spoke[0] ?? "");
+  check("세션당 1회임을 문구로 밝힘", /once per session/.test(firstCtx), firstCtx.slice(-200));
+  // "새로 저장 0건" 과 "볼트 총 N건" 이 동시에 읽혀도 모순으로 보이지 않아야 한다
+  check("무저장과 볼트 총량을 구분해 표현", /stored 0 new memories/.test(firstCtx) && /vault still holds \d+/.test(firstCtx), firstCtx.slice(0, 200));
 
   // 잡담 세션에는 남길 durable 한 사실이 없다 — 도구를 실제로 쓴 세션에만 말을 건다.
   // 줄 수로 재던 종전 방식은 실측 1439개 트랜스크립트에서 진짜 작업 세션의 38%를
@@ -293,18 +332,18 @@ console.log("6) 경고 빈도 — Stop 은 매 턴 발화한다");
   const tpWork = path.join(root, "t-work.jsonl");
   fs.writeFileSync(tpWork, toolUse(4), "utf-8"); // 줄은 4개뿐이지만 실제 작업이다
   const work = run(["--stop", "--vault-force", v2], root, stopEvent({ session_id: "S2", transcript_path: tpWork }));
-  check("줄 수가 적어도 도구를 썼으면 경고", /저장된 기억이 없습니다/.test(work.out), work.out.slice(0, 200));
+  check("줄 수가 적어도 도구를 썼으면 경고", stopContext(work.out) !== "", work.out.slice(0, 200));
 
   // 길이를 모를 때 침묵하면 안전망 자체가 사라진다
   const v3 = makeVault(root, "N3", 1);
   run(["--start", "--vault-force", v3], root, startEvent({ session_id: "S3", source: "startup" }));
   const unknown = run(["--stop", "--vault-force", v3], root, stopEvent({ session_id: "S3" }));
-  check("트랜스크립트 경로를 모르면 종전대로 경고", /저장된 기억이 없습니다/.test(unknown.out), unknown.out.slice(0, 200));
+  check("트랜스크립트 경로를 모르면 종전대로 경고", stopContext(unknown.out) !== "", unknown.out.slice(0, 200));
 
   const v4 = makeVault(root, "N4", 1);
   run(["--start", "--vault-force", v4], root, startEvent({ session_id: "S4", source: "startup" }));
   const gone = run(["--stop", "--vault-force", v4], root, stopEvent({ session_id: "S4", transcript_path: path.join(root, "없음.jsonl") }));
-  check("트랜스크립트가 없어도 경고(게이트 통과)", /저장된 기억이 없습니다/.test(gone.out), gone.out.slice(0, 200));
+  check("트랜스크립트가 없어도 경고(게이트 통과)", stopContext(gone.out) !== "", gone.out.slice(0, 200));
 
   // 서브에이전트 위임 세션은 부모 트랜스크립트에 흔적이 거의 없다 — 실제 작업은
   // 별도 컨텍스트에서 벌어졌는데 부모 기준으로는 잡담처럼 보여 게이트에 걸린다.
@@ -314,7 +353,58 @@ console.log("6) 경고 빈도 — Stop 은 매 턴 발화한다");
   fs.writeFileSync(tpAgent, '{"type":"tool_use","name":"Agent","input":{}}\n', "utf-8"); // 도구 1회 = 게이트 미만
   run(["--start", "--vault-force", v5], root, startEvent({ session_id: "S5", source: "startup" }));
   const delegated = run(["--stop", "--vault-force", v5], root, stopEvent({ session_id: "S5", transcript_path: tpAgent }));
-  check("서브에이전트에 위임한 세션도 경고 대상", /저장된 기억이 없습니다/.test(delegated.out), delegated.out.slice(0, 200));
+  check("서브에이전트에 위임한 세션도 경고 대상", stopContext(delegated.out) !== "", delegated.out.slice(0, 200));
+}
+
+// ── 5-b. 볼트 손실 감지 (H9)
+//
+// 고정하는 사고: 이 저장소의 라이브 볼트가 2026-07-18/19 에 19건이었는데 07-22 에 2건이었고
+// archive/ 는 비어 있었다. 즉 17건이 정상 경로가 아닌 방법으로 사라졌는데 **아무도 몰랐다.**
+// forget 은 삭제가 아니라 archive 이동이므로(P6) **활성+아카이브 총량은 정상적으로는 줄지 않는다.**
+console.log("5-b) 볼트 손실 감지");
+{
+  const root = freshDir("loss");
+  const v = makeVault(root, "L", 5);
+  const archiveOf = (vault) => path.join(vault, "archive");
+
+  // 1회차: 기준선 기록 (총 5건)
+  run(["--start", "--vault-force", v], root, startEvent({ session_id: "L1", source: "startup" }));
+  check("마커에 총량 기록", JSON.parse(readMarkerRaw(v)).total === 5, readMarkerRaw(v));
+
+  // forget 은 이동이다 — 총량 불변이므로 경고하면 안 된다 (오탐 방지)
+  fs.mkdirSync(archiveOf(v), { recursive: true });
+  fs.renameSync(path.join(v, "memories", "L-0.md"), path.join(archiveOf(v), "L-0.md"));
+  const forgot = run(["--start", "--vault-force", v], root, startEvent({ session_id: "L2", source: "startup" }));
+  check("forget(아카이브 이동)은 손실이 아님", !/MEMORY LOSS/.test(forgot.out), forgot.out.slice(0, 200));
+  check("이동 후에도 총량은 5로 유지", JSON.parse(readMarkerRaw(v)).total === 5, readMarkerRaw(v));
+
+  // 진짜 소실 — 볼트 밖에서 파일이 사라진다
+  fs.unlinkSync(path.join(v, "memories", "L-1.md"));
+  fs.unlinkSync(path.join(v, "memories", "L-2.md"));
+  const loss = run(["--start", "--vault-force", v], root, startEvent({ session_id: "L3", source: "startup" }));
+  check("총량이 줄면 손실 경고", /MEMORY LOSS DETECTED/.test(loss.out), loss.out.slice(0, 300));
+  check("몇 건 사라졌는지 명시", /held 5 memories .* holds 3 now/.test(loss.out.replace(/\n/g, " ")), loss.out.slice(0, 400));
+  check("중복 저장 금지를 지시", /do NOT start re-storing/.test(loss.out), loss.out.slice(0, 500));
+  check("경고해도 종료코드 0", loss.code === 0);
+
+  // 한 번 알렸으면 기준선이 갱신돼 다음 세션에는 조용하다 (경보 피로 방지)
+  const after = run(["--start", "--vault-force", v], root, startEvent({ session_id: "L4", source: "startup" }));
+  check("갱신 후에는 반복 경고 없음", !/MEMORY LOSS/.test(after.out), after.out.slice(0, 200));
+
+  // ★ 전부 사라진 경우 — 콜드 스타트 분기가 "빈 볼트는 정상" 이라고 안심시키면 안 된다
+  const v2 = makeVault(root, "M", 3);
+  run(["--start", "--vault-force", v2], root, startEvent({ session_id: "M1", source: "startup" }));
+  for (let i = 0; i < 3; i++) fs.unlinkSync(path.join(v2, "memories", `M-${i}.md`));
+  const wiped = run(["--start", "--vault-force", v2], root, startEvent({ session_id: "M2", source: "startup" }));
+  check("전멸해도 손실을 먼저 알림", /MEMORY LOSS DETECTED/.test(wiped.out), wiped.out.slice(0, 300));
+  check("손실 경고가 COLD START 보다 앞에 온다", wiped.out.indexOf("MEMORY LOSS") < wiped.out.indexOf("COLD START"), wiped.out.slice(0, 300));
+
+  // 구형 마커(총량 없음)에는 손실 판정을 하지 않는다 — 오경보보다 침묵이 낫다
+  const v3 = makeVault(root, "N", 4);
+  fs.writeFileSync(path.join(v3, ".bbm-session-start"), "4", "utf-8"); // 구형 숫자 마커
+  fs.unlinkSync(path.join(v3, "memories", "N-0.md"));
+  const legacyMarker = run(["--start", "--vault-force", v3], root, startEvent({ session_id: "N1", source: "startup" }));
+  check("구형 마커면 손실 판정 생략", !/MEMORY LOSS/.test(legacyMarker.out), legacyMarker.out.slice(0, 200));
 }
 
 // ── 6-b. 인덱스 절단을 숨기지 않는다 (H8)

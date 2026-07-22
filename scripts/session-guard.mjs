@@ -171,6 +171,29 @@ function countMemories() {
 }
 
 /**
+ * 활성 + 아카이브 총량. **손실 감지의 기준값**이다.
+ *
+ * 왜 활성 수가 아니라 총량인가 — `forget` 은 삭제가 아니라 archive 이동이므로(P6, 가역성)
+ * 활성 수만 보면 정상적인 망각과 진짜 소실이 구분되지 않는다. 총량은 정상 경로로는
+ * 줄어들 수 없다. 줄었다면 파일이 볼트 밖에서 사라진 것이다.
+ *
+ * 왜 필요한가 — 실측으로 확인된 사고다. 이 저장소의 라이브 볼트가 2026-07-18/19 에 19건이었는데
+ * 2026-07-22 에 2건이었고 `archive/` 는 비어 있었다. 즉 17건이 정상 경로가 아닌 방법으로
+ * 없어졌는데 **아무도 눈치채지 못했다.** 원자적 쓰기·손상 격리·구본 스냅샷을 다 갖춰 놓고도
+ * "건수가 줄었다" 를 보는 눈이 없었다. 기억이 사라지지 않는다는 보장은 대체의 전제다.
+ */
+function countTotal() {
+  const n = (dir) => {
+    try {
+      return fs.readdirSync(dir).filter((f) => f.endsWith(".md")).length;
+    } catch {
+      return 0;
+    }
+  };
+  return n(memoriesDir) + n(path.join(vaultDir, "archive"));
+}
+
+/**
  * 훅 입력 JSON 을 stdin 에서 읽는다 — `session_id`, `source`, `transcript_path` 가 온다.
  *
  * **절대 멈추면 안 된다.** stdin 이 닫히지 않는 파이프로 상속될 수 있고, Stop 훅은 매 턴
@@ -234,6 +257,8 @@ function readMarker() {
       return {
         sessionId: typeof o.sessionId === "string" ? o.sessionId : null,
         count: Number.isFinite(o.count) ? o.count : Number.NaN,
+        // 구형 마커에는 없다 — 없으면 손실 검사를 건너뛴다(오경보보다 침묵이 낫다)
+        total: Number.isFinite(o.total) ? o.total : Number.NaN,
         warned: o.warned === true,
       };
     }
@@ -241,7 +266,7 @@ function readMarker() {
     /* 구형 포맷 — 아래에서 숫자로 해석 */
   }
   const n = Number.parseInt(raw, 10);
-  return Number.isFinite(n) ? { sessionId: null, count: n, warned: false } : null;
+  return Number.isFinite(n) ? { sessionId: null, count: n, total: Number.NaN, warned: false } : null;
 }
 
 function writeMarker(m) {
@@ -266,16 +291,37 @@ if (mode === "start") {
   // 재현: startup(0) → 2건 저장 → compact(기준선 2) → 종료 시 "0건" 경고.
   // 그래서 session_id 가 같으면 기존 기준선을 **보존**한다.
   const prev = readMarker();
+  const total = countTotal();
   const sameSession =
     hookInput.sessionId && prev?.sessionId
       ? hookInput.sessionId === prev.sessionId
       : // session_id 를 못 받았을 때의 차선책 — 재개/압축은 이어지는 세션으로 본다
         !!prev && (hookInput.source === "resume" || hookInput.source === "compact");
-  if (!sameSession) writeMarker({ sessionId: hookInput.sessionId, count, warned: false });
+
+  // 2) 손실 감지. 총량(활성+아카이브)은 정상 경로로 줄어들 수 없다 —
+  // forget 은 이동이지 삭제가 아니기 때문이다. 줄었다면 볼트 밖에서 파일이 없어진 것이다.
+  // 새 세션에서만 본다(같은 세션 안의 재개·압축에서 반복 경고하지 않도록).
+  const lost = !sameSession && prev && Number.isFinite(prev.total) && prev.total > total ? prev.total - total : 0;
+
+  if (!sameSession) writeMarker({ sessionId: hookInput.sessionId, count, total, warned: false });
 
   // 볼트 디렉터리 자체가 없으면 침묵한다. 이건 콜드 스타트가 아니라 **설정이 어긋난**
   // 상태이고(경로 오타, 아직 이 프로젝트에 붙이지 않음), 그걸 매 세션 떠들면 노이즈다.
   if (!fs.existsSync(vaultDir)) process.exit(0);
+
+  // 손실은 **가장 먼저** 말한다. 특히 전부 사라져 count===0 이 된 경우, 아래 콜드 스타트 분기는
+  // "빈 볼트는 정상" 이라고 안심시키므로 정반대의 신호를 준다. 그 오해를 여기서 차단한다.
+  const lossWarning =
+    lost > 0
+      ? `<bigbrainmemory-alert severity="high">\n` +
+        `MEMORY LOSS DETECTED — the vault held ${lost + total} memories at the last session start and holds ${total} now ` +
+        `(active + archived). This count cannot drop on its own: \`forget\` moves files to archive/ instead of deleting, ` +
+        `so ${lost} memories disappeared outside the normal path — a wrong BIGBRAIN_VAULT path, an external delete, or a test ` +
+        `pointed at the live vault. Tell the user before doing anything else, and do NOT start re-storing from scratch ` +
+        `until the cause is known: if the vault is merely misconfigured, the memories still exist elsewhere and duplicating ` +
+        `them will split the vault in two.\n` +
+        `</bigbrainmemory-alert>\n`
+      : "";
 
   const attrs = `vault="${vaultDir.replace(/\\/g, "/")}" memories="${count}"`;
   // 지연 로드된 도구는 정확한 이름으로만 불러올 수 있다 — 이름을 그대로 노출한다.
@@ -296,7 +342,8 @@ if (mode === "start") {
   // 부족하고 이 주입이 실제 트리거다.
   if (count === 0) {
     process.stdout.write(
-      `<bigbrainmemory-index ${attrs}>\n` +
+      lossWarning +
+        `<bigbrainmemory-index ${attrs}>\n` +
         `COLD START — this vault holds 0 memories. That is expected on a fresh vault and is NOT ` +
         `evidence that memory is unneeded; it means seeding the vault is part of this session's job.\n` +
         toolLines +
@@ -337,7 +384,8 @@ if (mode === "start") {
   // "N일 전 관측이다 — 현재 코드와 대조하라" 를 자동으로 붙여 이 위험을 막는다.
   // 주입은 회상을 **대체하는 것이 아니라 시작점**이라는 점을 같은 블록 안에서 말한다.
   process.stdout.write(
-    `<bigbrainmemory-index ${attrs}>\n${body}\n</bigbrainmemory-index>\n` +
+    lossWarning +
+      `<bigbrainmemory-index ${attrs}>\n${body}\n</bigbrainmemory-index>\n` +
       toolLines +
       `These lines are point-in-time observations, not live state, and each carries its age. ` +
       `Treat them as a starting point for retrieval — not as verified fact: before asserting anything from ` +
@@ -391,9 +439,36 @@ if (hookInput.transcriptPath && MIN_TOOL_USES > 0) {
 }
 
 writeMarker({ ...m, warned: true });
+
+// **평문 stdout 으로 내면 아무에게도 도달하지 않는다.** 공식 문서:
+//   "For most events, stdout is written to the debug log but not shown in the transcript.
+//    The exceptions are UserPromptSubmit, UserPromptExpansion, and SessionStart,
+//    where stdout is added as context that Claude can see and act on."
+// Stop 은 그 예외 목록에 없다. 종전 구현은 이 경고를 평문으로 냈고, 그래서
+// 마커·세션키잉·1회제한·도구게이트라는 장치 전체가 **디버그 로그로만** 흘러갔다.
+// 회귀 테스트가 문자열만 검사해 통과시키는 바람에 6일간 드러나지 않았다.
+//
+// Stop 이 모델에 도달하는 유일한 비차단 경로는 JSON 의 hookSpecificOutput.additionalContext 다
+// (같은 문서: "Stop and SubagentStop also accept hookSpecificOutput.additionalContext
+//  for non-error feedback that continues the conversation").
+// decision:"block" 은 쓰지 않는다 — 세션을 막지 않는다는 이 파일의 원칙(파일 상단) 때문이다.
+//
+// 수신자가 사용자가 아니라 **모델**로 바뀌었으므로 문구도 그에 맞춘다. 사람에게 권하는
+// 안내문이 아니라, 모델이 지금 무엇을 판단해 무엇을 호출해야 하는지를 적는다.
+const tool = (n) => `mcp__${resolveServerName()}__${n}`;
 process.stdout.write(
-  `BigBrainMemory: 이 세션에서 새로 저장된 기억이 없습니다 (볼트 ${m.count}건 그대로).\n` +
-    `지속될 사실·결정·선호·교훈을 배웠다면 지금 \`remember\` 로 남기세요. ` +
-    `이번 대화에서만 쓸 내용이었다면 무시해도 됩니다. (이 알림은 세션당 한 번만 나옵니다)\n`,
+  `${JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: "Stop",
+      additionalContext:
+        `BigBrainMemory: this session stored 0 new memories (vault still holds ${m.count}). ` +
+        `Before finishing, check whether any REMEMBER trigger fired in this session — a decision settled, ` +
+        `the user corrected you or stated a preference, you found a non-obvious root cause, a convention was agreed. ` +
+        `If one did, call ${tool("remember")} now with what you still have verbatim in context. ` +
+        `This is a fallback: the right moment was when the trigger fired, not at the end. ` +
+        `If this session was compacted and you would be reconstructing from a summary rather than recalling verbatim, ` +
+        `store nothing and say so. If nothing durable came up, ignore this — it is shown once per session.`,
+    },
+  })}\n`,
 );
 process.exit(0); // 경고일 뿐 — 세션 종료를 막지 않는다
